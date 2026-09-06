@@ -1,0 +1,124 @@
+"""Hub-level stateful, non-HA-API logic for Boiler Flow Control.
+
+One instance per config entry. Owns the 10-minute low-pass filter on aggregate
+heat demand, the heating-active toggle counter over a rolling 10-minute window,
+the return-temperature freshness check, and the last-write memory used for
+manual-hold detection (persisted via `BFCStore` so it survives restart).
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+
+from homeassistant.util import dt as dt_util
+
+from .const import CYCLING_WINDOW_MINUTES, RETURN_FRESHNESS_MINUTES
+from .core.model import DhwCyclingState, WriteMemory
+from .store import BFCStore
+
+_LOGGER = logging.getLogger(__name__)
+
+DEMAND_FILTER_TAU_MINUTES = 10.0
+
+
+@dataclass
+class BoilerFlowHub:
+    """Runtime data for the hub config entry."""
+
+    store: BFCStore | None = None
+
+    # Demand low-pass filter
+    demand_filtered: float | None = None
+    _last_demand_sample_at: datetime | None = field(default=None, repr=False)
+
+    # Heating-active toggle counter
+    _last_active_state: bool | None = field(default=None, repr=False)
+    _toggle_times: list = field(default_factory=list, repr=False)
+
+    # Return-temperature freshness
+    return_last_seen_at: datetime | None = None
+    last_return_value: float | None = None
+
+    # Last-write memory (manual-hold detection)
+    last_written_setpoint: float | None = None
+    last_written_at: datetime | None = None
+
+    # DHW cycling guard state
+    dhw_cycling: DhwCyclingState = field(default_factory=DhwCyclingState)
+
+    global_enabled: bool = True
+
+    # ------------------------------------------------------------------
+    def load(self) -> None:
+        if self.store is None:
+            return
+        sp = self.store.get("last_written_setpoint")
+        self.last_written_setpoint = float(sp) if sp is not None else None
+        at = self.store.get("last_written_at")
+        parsed = dt_util.parse_datetime(str(at)) if at else None
+        self.last_written_at = dt_util.as_utc(parsed) if parsed else None
+        df = self.store.get("demand_filtered")
+        self.demand_filtered = float(df) if df is not None else None
+        attempts = self.store.get("dhw_cycling_attempts")
+        holding = self.store.get("dhw_cycling_holding")
+        if attempts is not None or holding is not None:
+            self.dhw_cycling = DhwCyclingState(attempts=int(attempts or 0), holding=bool(holding))
+
+    def _persist(self) -> None:
+        if self.store is None:
+            return
+        self.store.set("last_written_setpoint", self.last_written_setpoint)
+        self.store.set("last_written_at", self.last_written_at.isoformat() if self.last_written_at else None)
+        self.store.set("demand_filtered", self.demand_filtered)
+        self.store.set("dhw_cycling_attempts", self.dhw_cycling.attempts)
+        self.store.set("dhw_cycling_holding", self.dhw_cycling.holding)
+
+    # ------------------------------------------------------------------
+    def sample_demand(self, raw: float | None, now: datetime) -> float | None:
+        """10-minute low-pass filter on aggregate heat demand (§3.2.2)."""
+        if raw is None:
+            return self.demand_filtered
+        if self.demand_filtered is None:
+            self.demand_filtered = raw
+        else:
+            dt_s = (now - self._last_demand_sample_at).total_seconds() if self._last_demand_sample_at else 60.0
+            alpha = dt_s / (DEMAND_FILTER_TAU_MINUTES * 60.0 + dt_s)
+            self.demand_filtered += alpha * (raw - self.demand_filtered)
+        self._last_demand_sample_at = now
+        return self.demand_filtered
+
+    def sample_heating_active(self, is_active: bool | None, now: datetime) -> int:
+        """Count toggles of the heating-active flag in the trailing window (§3.2.4, §3.3.3)."""
+        if is_active is not None and self._last_active_state is not None and is_active != self._last_active_state:
+            self._toggle_times.append(now)
+        if is_active is not None:
+            self._last_active_state = is_active
+        cutoff = now - timedelta(minutes=CYCLING_WINDOW_MINUTES)
+        self._toggle_times = [t for t in self._toggle_times if t >= cutoff]
+        return len(self._toggle_times)
+
+    def sample_return(self, value: float | None, now: datetime) -> tuple[float | None, bool]:
+        """Return (value_to_use, fresh). Fresh means seen within RETURN_FRESHNESS_MINUTES."""
+        if value is not None:
+            self.return_last_seen_at = now
+            self.last_return_value = value
+        fresh = self.return_last_seen_at is not None and now - self.return_last_seen_at < timedelta(minutes=RETURN_FRESHNESS_MINUTES)
+        return self.last_return_value, fresh
+
+    def record_write(self, value: float, now: datetime) -> None:
+        self.last_written_setpoint = value
+        self.last_written_at = now
+        self._persist()
+
+    def write_memory(self) -> WriteMemory:
+        return WriteMemory(last_written_setpoint=self.last_written_setpoint, last_written_at=self.last_written_at)
+
+    def set_dhw_cycling(self, state: DhwCyclingState) -> None:
+        self.dhw_cycling = state
+        self._persist()
+
+    async def async_save(self) -> None:
+        self._persist()
+        if self.store is not None:
+            await self.store.async_save()

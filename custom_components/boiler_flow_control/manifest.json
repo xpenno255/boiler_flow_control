@@ -1,0 +1,11 @@
+{
+  "domain": "boiler_flow_control",
+  "name": "Boiler Flow Control",
+  "codeowners": ["@xpenno255"],
+  "config_flow": true,
+  "documentation": "https://github.com/xpenno255/boiler_flow_control",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/xpenno255/boiler_flow_control/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

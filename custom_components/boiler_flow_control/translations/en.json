@@ -1,0 +1,88 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Boiler Flow Control",
+        "data": {
+          "flow_setpoint_entity": "Flow setpoint number (ems-esp selflowtemp)",
+          "outdoor_temp_entity": "Outdoor temperature sensor"
+        },
+        "sections": {
+          "optional_section": {
+            "name": "Optional inputs",
+            "data": {
+              "current_flow_entity": "Current flow temperature",
+              "return_temp_entity": "Return temperature",
+              "heating_active_entity": "Heating active flag",
+              "burner_power_entity": "Burner power",
+              "heat_demand_entity": "Aggregate heat demand",
+              "hw_relay_demand_entity": "Hot-water relay demand",
+              "cylinder_temp_entity": "Cylinder temperature",
+              "max_flow_entity": "Maximum flow number (boiler max setpoint)"
+            }
+          },
+          "tunables_section": {
+            "name": "Tunables",
+            "data": {
+              "flow_min": "Flow floor",
+              "flow_max": "Flow ceiling",
+              "dhw_flow_min": "DHW flow floor",
+              "dhw_flow_max": "DHW flow ceiling",
+              "dhw_return_ceiling": "DHW return ceiling",
+              "min_hold_minutes": "Minimum time between heating writes",
+              "manual_hold_minutes": "Manual hold duration"
+            }
+          }
+        }
+      }
+    },
+    "abort": {"already_configured": "Boiler Flow Control is already configured. Edit it from the integration's options."}
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Options",
+        "data": {
+          "flow_setpoint_entity": "Flow setpoint number (ems-esp selflowtemp)",
+          "outdoor_temp_entity": "Outdoor temperature sensor"
+        },
+        "sections": {
+          "optional_section": {
+            "name": "Optional inputs",
+            "data": {
+              "current_flow_entity": "Current flow temperature",
+              "return_temp_entity": "Return temperature",
+              "heating_active_entity": "Heating active flag",
+              "burner_power_entity": "Burner power",
+              "heat_demand_entity": "Aggregate heat demand",
+              "hw_relay_demand_entity": "Hot-water relay demand",
+              "cylinder_temp_entity": "Cylinder temperature",
+              "max_flow_entity": "Maximum flow number (boiler max setpoint)"
+            }
+          },
+          "tunables_section": {
+            "name": "Tunables",
+            "data": {
+              "flow_min": "Flow floor",
+              "flow_max": "Flow ceiling",
+              "dhw_flow_min": "DHW flow floor",
+              "dhw_flow_max": "DHW flow ceiling",
+              "dhw_return_ceiling": "DHW return ceiling",
+              "min_hold_minutes": "Minimum time between heating writes",
+              "manual_hold_minutes": "Manual hold duration"
+            }
+          }
+        }
+      }
+    }
+  },
+  "selector": {
+    "mode_override": {"options": {"auto": "Auto (write to the boiler)", "shadow": "Shadow (compute only, write nothing)", "hold": "Hold (compute, never write)"}}
+  },
+  "issues": {
+    "dhw_cycling_unfixable": {
+      "title": "DHW cycling guard could not stop the boiler cycling",
+      "description": "The coil, pump or minimum burner power need attention; flow-temperature correction alone cannot fix it. Flow is being held at the DHW floor."
+    }
+  }
+}
