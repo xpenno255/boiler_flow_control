@@ -110,10 +110,22 @@ class DhwParams:
 
 @dataclass(frozen=True)
 class DhwCyclingState:
-    """Tracks whether the cycling guard has already tried once and failed."""
+    """Tracks whether the cycling guard has already tried once and failed.
+
+    `last_intervention_at` (v0.2.1 review fix 3a) marks the last time an
+    attempt was counted (a correction step or the sticky hold itself); only
+    ignitions occurring after that point count towards the next attempt, so a
+    single stale batch of ignitions sitting in the 10-minute window cannot
+    keep re-triggering attempts on every 60 s poll.
+    """
 
     attempts: int = 0
     holding: bool = False  # sticky: once True, stays True until manually cleared
+    last_intervention_at: datetime | None = None
+    # Cumulative correction from interventions this charge. Persists across
+    # quiet polls — a -5 K step must keep holding the flow down while we wait
+    # to see whether new ignitions accrue, not evaporate on the next poll.
+    correction_k: float = 0.0
 
 
 # ---------------------------------------------------------------------------

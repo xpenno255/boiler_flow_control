@@ -13,7 +13,7 @@ from .store import BFCStore
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = ["sensor", "switch", "select", "number"]
+PLATFORMS = ["sensor", "switch", "select", "number", "button"]
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:

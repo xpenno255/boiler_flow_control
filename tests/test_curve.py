@@ -148,6 +148,35 @@ def test_demand_step_gated_by_step_period():
     assert s.correction == pytest.approx(2.0)
 
 
+def test_demand_inactive_decays_towards_zero_even_with_high_demand():
+    # v0.2.1 review fix 11: idle/dhw must not accumulate the demand correction;
+    # a saturated +8 must decay back towards 0 even while demand reads high.
+    s = DemandCorrectionState(correction=8.0)
+    now = T0
+    s = demand_correction_step(s, 90.0, now, active=False)
+    assert s.correction == pytest.approx(6.0)
+    now = now + timedelta(minutes=10)
+    s = demand_correction_step(s, 90.0, now, active=False)
+    assert s.correction == pytest.approx(4.0)
+
+
+def test_demand_inactive_holds_at_zero():
+    s = DemandCorrectionState(correction=0.0)
+    s2 = demand_correction_step(s, 90.0, T0, active=False)
+    assert s2 == s
+
+
+def test_demand_inactive_negative_decays_upward():
+    s = DemandCorrectionState(correction=-8.0)
+    s = demand_correction_step(s, 5.0, T0, active=False)
+    assert s.correction == pytest.approx(-6.0)
+
+
+def test_demand_none_still_freezes_regardless_of_active():
+    s = DemandCorrectionState(correction=4.0)
+    assert demand_correction_step(s, None, T0, active=False) == s
+
+
 # --- return ceiling, heating (§3.2.3) ---------------------------------------
 
 
@@ -224,15 +253,24 @@ def test_heating_target_never_below_flow_min():
 
 
 def test_dhw_target_basic_clamped():
-    value, state, issue = dhw_target(30.0, None, False, 0, DhwCyclingState())
+    value, state, issue = dhw_target(30.0, None, False, 0, DhwCyclingState(), T0)
     assert value == pytest.approx(55.0)  # 30+20=50, clamped to dhw_flow_min 55
     assert not issue and not state.holding
 
-    value2, _, _ = dhw_target(55.0, None, False, 0, DhwCyclingState())
+    value2, _, _ = dhw_target(55.0, None, False, 0, DhwCyclingState(), T0)
     assert value2 == pytest.approx(70.0)  # 55+20=75, clamped to dhw_flow_max 70
 
-    value3, _, _ = dhw_target(45.0, None, False, 0, DhwCyclingState())
+    value3, _, _ = dhw_target(45.0, None, False, 0, DhwCyclingState(), T0)
     assert value3 == pytest.approx(65.0)  # 45+20=65, within bounds
+
+
+def test_dhw_target_correction_applied_after_clamp_not_before():
+    # v0.2.1 review fix 4: at the dhw_flow_max ceiling, a return-ceiling
+    # correction must actually reduce the target, not vanish because the
+    # pre-correction sum was reclamped back up to the ceiling.
+    value, _, _ = dhw_target(55.0, 65.0, True, 0, DhwCyclingState(), T0)
+    # base = clamp(55+20, 55, 70) = 70; return correction -3 => 67, not 70.
+    assert value == pytest.approx(67.0)
 
 
 def test_dhw_return_correction_only_when_fresh_and_over_ceiling():
@@ -244,26 +282,73 @@ def test_dhw_return_correction_only_when_fresh_and_over_ceiling():
 
 def test_dhw_cycling_first_episode_then_second_holds_and_raises_issue():
     state = DhwCyclingState()
-    correction, state, issue = dhw_cycling_correction(state, 4)
+    correction, state, issue = dhw_cycling_correction(state, 4, T0)
     assert correction == pytest.approx(-5.0) and not issue and not state.holding
-    correction, state, issue = dhw_cycling_correction(state, 4)
+    assert state.last_intervention_at == T0
+    correction, state, issue = dhw_cycling_correction(state, 4, T0 + timedelta(minutes=15))
     assert issue and state.holding and correction == 0.0
     # sticky: still holding even if cycling has stopped
-    correction, state, issue = dhw_cycling_correction(state, 0)
+    correction, state, issue = dhw_cycling_correction(state, 0, T0 + timedelta(minutes=30))
     assert state.holding and not issue
 
 
-def test_dhw_cycling_clears_attempts_when_not_cycling():
-    state = DhwCyclingState(attempts=1)
-    correction, state, issue = dhw_cycling_correction(state, 0)
-    assert correction == 0.0 and state.attempts == 0 and not state.holding and not issue
+def test_dhw_cycling_quiet_poll_preserves_attempts_and_correction():
+    # A quiet poll mid-episode must not drop the intervention: the -5 K keeps
+    # holding the flow down and the attempt stays counted while we wait to see
+    # whether new ignitions accrue. Reset happens at charge end (coordinator).
+    state = DhwCyclingState(attempts=1, last_intervention_at=T0, correction_k=-5.0)
+    correction, state, issue = dhw_cycling_correction(state, 0, T0 + timedelta(seconds=60))
+    assert correction == pytest.approx(-5.0) and state.attempts == 1 and not state.holding and not issue
 
 
 def test_dhw_target_holds_at_floor_after_second_cycling_failure():
     state = DhwCyclingState()
-    _, state, _ = dhw_target(40.0, None, False, 5, state)
-    value, state, issue = dhw_target(40.0, None, False, 5, state)
+    _, state, _ = dhw_target(40.0, None, False, 5, state, T0)
+    value, state, issue = dhw_target(40.0, None, False, 5, state, T0 + timedelta(minutes=15))
     assert issue and value == pytest.approx(55.0) and state.holding
+
+
+# --- DHW cycling episode semantics (v0.2.1 review fix 3a) --------------------
+
+
+def test_dhw_cycling_only_ignitions_after_intervention_count():
+    # Simulates the coordinator passing ignitions-since-last-intervention:
+    # the same stale count sitting in the window (as `cycles_10min` would
+    # report every poll) must not keep re-triggering attempts.
+    state = DhwCyclingState()
+    correction, state, issue = dhw_cycling_correction(state, 4, T0)
+    assert correction == pytest.approx(-5.0) and not state.holding
+    # 60s later: coordinator recomputes ignitions-since-intervention, which is
+    # 0 (no new ignitions since T0) even though the raw window count is still 4.
+    # No new attempt fires, and the standing -5 K correction persists.
+    correction, state, issue = dhw_cycling_correction(state, 0, T0 + timedelta(seconds=60))
+    assert correction == pytest.approx(-5.0) and state.attempts == 1 and not issue
+    # Once genuinely new ignitions accumulate past the threshold, the first
+    # intervention has failed: second attempt hits the fail limit and holds.
+    correction, state, issue = dhw_cycling_correction(state, 3, T0 + timedelta(minutes=8))
+    assert state.holding and issue and correction == 0.0
+
+
+def test_dhw_cycling_persisting_episode_reaches_sticky_hold():
+    # Full arc: intervene at -5 K, quiet polls keep it applied, boiler keeps
+    # cycling anyway -> new post-intervention ignitions -> sticky hold + issue.
+    state = DhwCyclingState()
+    correction, state, _ = dhw_cycling_correction(state, 3, T0)
+    assert correction == pytest.approx(-5.0)
+    for m in (1, 2, 3):  # quiet polls while new ignitions accrue below threshold
+        correction, state, issue = dhw_cycling_correction(state, m - 1, T0 + timedelta(minutes=m))
+        assert correction == pytest.approx(-5.0) and not state.holding and not issue
+    correction, state, issue = dhw_cycling_correction(state, 3, T0 + timedelta(minutes=4))
+    assert state.holding and issue
+
+
+def test_dhw_target_shadow_computation_does_not_mutate_input_state():
+    # dhw_target/dhw_cycling_correction are pure: calling them for a "would
+    # write" preview must not affect the caller's own state object.
+    state = DhwCyclingState(attempts=1)
+    _value, new_state, _issue = dhw_target(40.0, None, False, 4, state, T0)
+    assert state.attempts == 1  # original untouched
+    assert new_state.attempts == 2
 
 
 # --- hysteresis / min-hold (§3.2.6) ------------------------------------------
@@ -291,6 +376,26 @@ def test_should_write_big_change_past_min_hold_true():
 def test_should_write_exempt_bypasses_everything():
     m = WriteMemory(last_written_setpoint=50.0, last_written_at=T0)
     assert should_write(50.2, m, T0 + timedelta(seconds=1), exempt=True)
+
+
+def test_should_write_gates_on_last_target_change_not_last_written_at():
+    # v0.2.1 review fix 1: under re-assertion, last_written_at advances every
+    # cycle (change 2) but last_target_change only advances when the target
+    # itself changes. A big change must unblock once min_hold has elapsed
+    # since last_target_change, even though last_written_at is only seconds old.
+    m = WriteMemory(last_written_setpoint=50.0, last_written_at=T0, last_target_change=T0)
+    now = T0
+    for _ in range(20):  # simulate 20 re-assertion cycles (60s poll), each bumping last_written_at
+        now = now + timedelta(minutes=1)
+        m = WriteMemory(last_written_setpoint=50.0, last_written_at=now, last_target_change=T0)
+    # last_written_at is now ~20 min old (recent), last_target_change is still T0 (>10 min ago)
+    assert should_write(53.0, m, now)
+
+
+def test_should_write_falls_back_to_last_written_at_when_no_target_change_recorded():
+    m = WriteMemory(last_written_setpoint=50.0, last_written_at=T0, last_target_change=None)
+    assert not should_write(53.0, m, T0 + timedelta(minutes=2))
+    assert should_write(53.0, m, T0 + timedelta(minutes=11))
 
 
 def test_clamp_helper():

@@ -68,6 +68,20 @@ def _strip_empty(flat: dict, keys: tuple[str, ...]) -> dict:
     return flat
 
 
+def _validate_ranges(flat: dict) -> dict[str, str]:
+    """v0.2.1 review fix 10: reject flow_min > flow_max and dhw_flow_min >
+    dhw_flow_max with a form error instead of silently accepting an inverted
+    range."""
+    errors: dict[str, str] = {}
+    flow_min, flow_max = flat.get(CONF_FLOW_MIN), flat.get(CONF_FLOW_MAX)
+    if flow_min is not None and flow_max is not None and flow_min > flow_max:
+        errors[CONF_FLOW_MAX] = "flow_min_above_max"
+    dhw_min, dhw_max = flat.get(CONF_DHW_FLOW_MIN), flat.get(CONF_DHW_FLOW_MAX)
+    if dhw_min is not None and dhw_max is not None and dhw_min > dhw_max:
+        errors[CONF_DHW_FLOW_MAX] = "dhw_flow_min_above_max"
+    return errors
+
+
 def entities_schema(d: dict[str, Any] | None = None) -> vol.Schema:
     d = d or {}
     return vol.Schema(
@@ -117,6 +131,9 @@ class BFCConfigFlow(ConfigFlow, domain=DOMAIN):
             return self.async_abort(reason="already_configured")
         if user_input is not None:
             flat = _strip_empty(_flatten(user_input), OPTIONAL_ENTITY_KEYS)
+            errors = _validate_ranges(flat)
+            if errors:
+                return self.async_show_form(step_id="user", data_schema=entities_schema(flat), errors=errors)
             return self.async_create_entry(title="Boiler Flow Control", data=flat)
         return self.async_show_form(step_id="user", data_schema=entities_schema())
 
@@ -130,5 +147,8 @@ class BFCOptionsFlow(OptionsFlow):
         current = {**self.config_entry.data, **self.config_entry.options}
         if user_input is not None:
             flat = _strip_empty(_flatten(user_input), OPTIONAL_ENTITY_KEYS)
+            errors = _validate_ranges(flat)
+            if errors:
+                return self.async_show_form(step_id="init", data_schema=entities_schema(flat), errors=errors)
             return self.async_create_entry(title="", data=flat)
         return self.async_show_form(step_id="init", data_schema=entities_schema(current))

@@ -36,7 +36,11 @@
         }
       }
     },
-    "abort": {"already_configured": "Boiler Flow Control is already configured. Edit it from the integration's options."}
+    "abort": {"already_configured": "Boiler Flow Control is already configured. Edit it from the integration's options."},
+    "error": {
+      "flow_min_above_max": "Flow floor must not be above flow ceiling.",
+      "dhw_flow_min_above_max": "DHW flow floor must not be above DHW flow ceiling."
+    }
   },
   "options": {
     "step": {
@@ -74,6 +78,10 @@
           }
         }
       }
+    },
+    "error": {
+      "flow_min_above_max": "Flow floor must not be above flow ceiling.",
+      "dhw_flow_min_above_max": "DHW flow floor must not be above DHW flow ceiling."
     }
   },
   "selector": {

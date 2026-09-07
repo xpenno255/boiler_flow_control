@@ -154,3 +154,62 @@ polled 60 s cycle counter recorded only three — sub-minute toggles were underc
   10-minute window as it happens, independent of the 60 s poll. The poll only reads the
   current window size for the sensor entity; it no longer feeds the counter. See
   `hub.record_ignition` / `hub.cycles_10min` and `coordinator.async_subscribe_heating_active`.
+
+## 11. v0.2.1 review fixes (2026-09-07)
+
+Twelve findings from an independent code review, addressed as follows. All are covered by
+regression tests in `tests/`.
+
+1. **Min-hold gated on the wrong timestamp.** `should_write` compared against
+   `last_written_at`, which advances on every re-assertion (finding 2 above), so a target
+   change ≥1 K could never clear its own gate. Now gated on `last_target_change` (falling
+   back to `last_written_at` for state persisted before this fix). See `core.curve.should_write`.
+2. **Failed writes were recorded as successful.** `number.set_value` is now called with
+   `blocking=True`; `coordinator._perform` returns whether it actually succeeded, and
+   `last_written_setpoint`/`last_target_change` are only advanced on success. A failed write
+   no longer masquerades as a manual hand-turn on the next cycle.
+3. **DHW cycling guard reached its sticky hold in ~2 minutes.** `DhwCyclingState` gained
+   `last_intervention_at`; an attempt now counts only when the threshold is met by
+   ignitions *after* the last intervention (`hub.ignitions_since`), not the raw trailing-window
+   count, which used to re-trigger on the same stale ignitions every poll. Attempts reset to
+   0 when a DHW charge ends without reaching the hold. The cycling state is only
+   mutated/persisted when enabled and override is auto; shadow/hold compute the correction
+   for `would_write` from the real state without persisting it, so merely observing a
+   cycling charge in shadow mode cannot poison future auto operation. A new
+   **"Reset DHW cycling hold"** button entity (`button.py`) clears the sticky hold + attempts
+   and deletes the `dhw_cycling_unfixable` repair issue.
+4. **DHW corrections vanished at the flow ceiling.** `dhw_target` now clamps
+   `cylinder + dhw_delta` to `[dhw_flow_min, dhw_flow_max]` *before* applying the return/cycling
+   corrections, then only floors the result at `dhw_flow_min` — a −3/−5 K correction at the
+   70 °C ceiling now actually reduces the target instead of being reclamped away.
+5. **A wedged-but-numeric return sensor stayed "fresh" forever.** `hub.sample_return` now
+   takes the entity's own `last_reported` (falling back to `last_updated`) instead of poll
+   time; freshness is numeric-and-recent-by-the-sensor's-own-clock. The existing grace
+   period (last value usable until that same deadline) is unchanged.
+6. **The heating return-ceiling accumulator ran during DHW.** It saturated at its −8 K floor
+   against the heating ceiling (50 °C) during every DHW charge and applied on exit. The
+   coordinator now freezes it whenever mode is `dhw`/`dhw_and_heating` — DHW has its own
+   `dhw_return_correction`.
+7. **The ignition-counter event handler ran off the event loop**, racing the poll's prune of
+   the same list. `_handle_heating_active_event` is now decorated `@callback`.
+8. **Restarts inflated the ignition counter.** `unavailable`→`on`, `unknown`→`on`, and initial
+   entity creation (no `old_state`) were all counted as ignitions. Only an exact
+   `old_state == "off"` → `"on"` transition counts now.
+9. **Cleared options resurfaced from the original config data.** The coordinator merged
+   `{**entry.data, **entry.options}`, so a field removed via the options flow reappeared from
+   `entry.data`. It now uses `entry.options` wholesale once any options have been submitted
+   (`dict(entry.options) if entry.options else dict(entry.data)`); the options flow already
+   submits the complete config each time (every field as shown, cleared fields absent).
+10. **Config/options accepted inverted ranges.** `flow_min > flow_max` and
+    `dhw_flow_min > dhw_flow_max` are now rejected with a form error instead of being saved.
+11. **Idle parked at the corrected heating value, not the curve.** Idle now targets the bare
+    heating curve (already clamped to `[flow_min, flow_max]`), not
+    demand/return/cycling-corrected `heating_value`. Relatedly, the demand-correction state
+    now only accumulates while mode is `heating`/`dhw_and_heating`; in idle/dhw it decays
+    towards 0 at its normal cadence (`core.curve.demand_correction_step(..., active=False)`)
+    instead of continuing to saturate, which previously left heating starting 8 K low after
+    any idle period.
+12. **A demand-sensor outage kept stepping the correction on stale data.** The coordinator now
+    tracks whether the *raw* demand reading (pre-filter) is available; when it is not, the
+    demand-correction state is frozen (no stepping in either direction) rather than acting on
+    the held, filtered value.

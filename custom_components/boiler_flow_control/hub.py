@@ -65,8 +65,14 @@ class BoilerFlowHub:
         self.demand_filtered = float(df) if df is not None else None
         attempts = self.store.get("dhw_cycling_attempts")
         holding = self.store.get("dhw_cycling_holding")
-        if attempts is not None or holding is not None:
-            self.dhw_cycling = DhwCyclingState(attempts=int(attempts or 0), holding=bool(holding))
+        intervention_at = self.store.get("dhw_cycling_last_intervention_at")
+        parsed_intervention = dt_util.parse_datetime(str(intervention_at)) if intervention_at else None
+        if attempts is not None or holding is not None or intervention_at is not None:
+            self.dhw_cycling = DhwCyclingState(
+                attempts=int(attempts or 0),
+                holding=bool(holding),
+                last_intervention_at=dt_util.as_utc(parsed_intervention) if parsed_intervention else None,
+            )
 
     def _persist(self) -> None:
         if self.store is None:
@@ -77,6 +83,10 @@ class BoilerFlowHub:
         self.store.set("demand_filtered", self.demand_filtered)
         self.store.set("dhw_cycling_attempts", self.dhw_cycling.attempts)
         self.store.set("dhw_cycling_holding", self.dhw_cycling.holding)
+        self.store.set(
+            "dhw_cycling_last_intervention_at",
+            self.dhw_cycling.last_intervention_at.isoformat() if self.dhw_cycling.last_intervention_at else None,
+        )
 
     # ------------------------------------------------------------------
     def sample_demand(self, raw: float | None, now: datetime) -> float | None:
@@ -109,11 +119,29 @@ class BoilerFlowHub:
         self._toggle_times = [t for t in self._toggle_times if t >= cutoff]
         return len(self._toggle_times)
 
-    def sample_return(self, value: float | None, now: datetime) -> tuple[float | None, bool]:
-        """Return (value_to_use, fresh). Fresh means seen within RETURN_FRESHNESS_MINUTES."""
+    def ignitions_since(self, since: datetime | None, now: datetime) -> int:
+        """Ignition count in the trailing window that occurred strictly after
+        `since` (v0.2.1 review fix 3a: the DHW cycling guard's last
+        intervention), or the whole window's count when `since` is None (no
+        intervention yet). Used instead of `cycles_10min` for the DHW cycling
+        guard so a single batch of ignitions cannot re-trigger an attempt on
+        every 60 s poll while it ages out of the window."""
+        cutoff = now - timedelta(minutes=CYCLING_WINDOW_MINUTES)
+        self._toggle_times = [t for t in self._toggle_times if t >= cutoff]
+        if since is None:
+            return len(self._toggle_times)
+        return len([t for t in self._toggle_times if t > since])
+
+    def sample_return(self, value: float | None, last_reported: datetime | None, now: datetime) -> tuple[float | None, bool]:
+        """Return (value_to_use, fresh). Fresh means the sensor's own
+        `last_reported` (v0.2.1 review fix 5) is within RETURN_FRESHNESS_MINUTES
+        of `now` — not merely that the state was numeric at poll time, which let
+        a wedged-but-numeric sensor stay "fresh" forever. Grace: once the
+        sensor goes unavailable, the last known value/timestamp keeps being
+        used until that same deadline passes."""
         if value is not None:
-            self.return_last_seen_at = now
             self.last_return_value = value
+            self.return_last_seen_at = last_reported or now
         fresh = self.return_last_seen_at is not None and now - self.return_last_seen_at < timedelta(minutes=RETURN_FRESHNESS_MINUTES)
         return self.last_return_value, fresh
 

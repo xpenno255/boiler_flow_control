@@ -20,7 +20,9 @@ instead of short cycles. Full behavioural spec: `docs/spec.md`.
   sensor misses some charges over RF. `dhw_and_heating` still requires the relay signal;
   the inference cannot separate it from plain high heating demand. If the cycling guard
   fails twice it holds at `dhw_flow_min` and raises a repair issue — the coil/pump/minimum
-  burner power need attention, software cannot fix it.
+  burner power need attention, software cannot fix it. Use the **"Reset DHW cycling
+  hold"** button to clear the hold + attempt counter and dismiss the repair issue once the
+  underlying issue has been addressed (or to retry after a false trip).
 - Detects a manual change to the flow-setpoint entity and holds off for `manual_hold_minutes`.
   A live value that reverts to the current max-flow (dial) value is never treated as manual
   — the boiler decays an un-rewritten setpoint back to the dial by itself.
@@ -52,6 +54,8 @@ writes without disabling the integration.
   as distinct from `last_write`, which advances every re-assertion in auto mode).
 - `switch.bfc_enabled`, `select.bfc_mode_override` (auto / shadow / hold).
 - `number.bfc_design_flow`, `number.bfc_design_outdoor`, `number.bfc_return_ceiling`, `number.bfc_dhw_delta`.
+- `button.bfc_reset_dhw_cycling_hold` — clears the sticky DHW cycling hold + attempt
+  counter and deletes the `dhw_cycling_unfixable` repair issue.
 
 ## Configuration
 
@@ -84,6 +88,10 @@ The owner's real entity ids (see `docs/spec.md` §2), for reference when configu
 
 The remaining tunables (`flow_min`, `flow_max`, `dhw_flow_min`, `dhw_flow_max`,
 `dhw_return_ceiling`, `min_hold_minutes`, `manual_hold_minutes`) live in the options flow.
+Submitting the options flow replaces the whole configuration: clearing an optional entity
+there removes it for good (it will not resurface from the original setup on a later
+reload), and `flow_min`/`dhw_flow_min` must not be set above their matching
+`flow_max`/`dhw_flow_max` — the form rejects that with an error.
 
 **Before switching to auto**, disable the owner's existing "ramp to 70 °C on DHW"
 automation — otherwise the two fight over the same flow setpoint (§3.4).

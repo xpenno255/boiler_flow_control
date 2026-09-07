@@ -55,15 +55,33 @@ def demand_correction_step(
     demand_filtered: float | None,
     now: datetime,
     params: DemandCorrectionParams = DemandCorrectionParams(),
+    active: bool = True,
 ) -> DemandCorrectionState:
     """Advance the demand-correction state machine by one cycle.
 
     Above `high_threshold` for `sustain_minutes` -> +step_k every step_period_minutes,
     up to +max_k. Below `low_threshold` for `sustain_minutes` -> mirrors down to -max_k.
     Between the thresholds the correction decays back towards 0 at the same cadence.
+
+    `active=False` (v0.2.1 review fix 11 — idle/dhw) skips the high/low
+    accumulation entirely and only decays any existing correction towards 0 at
+    the normal cadence, so idle/dhw cannot accumulate the demand correction
+    that heating built up (it would otherwise saturate at -8 while idle and
+    heating would start 8 K low next time).
     """
     if demand_filtered is None:
         return state  # no data: hold the last correction
+
+    if not active:
+        if state.correction == 0.0:
+            return state
+        if state.last_step_at is not None and now - state.last_step_at < timedelta(minutes=params.step_period_minutes):
+            return state
+        if state.correction > 0:
+            correction = max(0.0, state.correction - params.step_k)
+        else:
+            correction = min(0.0, state.correction + params.step_k)
+        return DemandCorrectionState(correction=correction, high_since=None, low_since=None, last_step_at=now)
 
     high = demand_filtered > params.high_threshold
     low = demand_filtered < params.low_threshold
@@ -170,24 +188,36 @@ def dhw_return_correction(return_temp: float | None, fresh: bool, params: DhwPar
 def dhw_cycling_correction(
     state: DhwCyclingState,
     toggle_count: int,
+    now: datetime,
     params: DhwParams = DhwParams(),
 ) -> tuple[float, DhwCyclingState, bool]:
     """Returns (correction, new_state, issue_raised).
 
-    First cycling episode: -cycling_step_k and log. If cycling persists into a
-    second episode, hold at dhw_flow_min and raise a repair issue (§3.3.3);
-    the hold is sticky until cleared outside this function (the coil/pump/
-    min-power need attention, software cannot fix it).
+    `toggle_count` is the ignition count in the trailing window that occurred
+    *after* `state.last_intervention_at` (v0.2.1 review fix 3a), not the raw
+    window total: otherwise the same batch of ignitions sitting in the
+    10-minute window would keep re-triggering an attempt on every 60 s poll,
+    reaching the sticky hold in 2 minutes instead of across genuinely separate
+    episodes. First cycling episode: -cycling_step_k and log. If cycling
+    persists into a second episode, hold at dhw_flow_min and raise a repair
+    issue (§3.3.3); the hold is sticky until cleared outside this function
+    (the coil/pump/min-power need attention, software cannot fix it).
     """
     if state.holding:
         return 0.0, state, False  # already holding; caller clamps to dhw_flow_min
     cycling = toggle_count >= params.toggle_threshold
     if not cycling:
-        return 0.0, DhwCyclingState(attempts=0, holding=False), False
+        # Quiet poll: an episode is still in flight — keep the correction and
+        # the attempt count. Dropping them here would pop the flow back up
+        # after 60 s and make the fail limit unreachable while the boiler is
+        # still accumulating post-intervention ignitions. Attempts reset at
+        # charge end (coordinator), not on a quiet poll.
+        return state.correction_k, state, False
     attempts = state.attempts + 1
     if attempts >= params.cycling_fail_limit:
-        return 0.0, DhwCyclingState(attempts=attempts, holding=True), True
-    return -params.cycling_step_k, DhwCyclingState(attempts=attempts, holding=False), False
+        return 0.0, DhwCyclingState(attempts=attempts, holding=True, last_intervention_at=now, correction_k=state.correction_k), True
+    correction = state.correction_k - params.cycling_step_k
+    return correction, DhwCyclingState(attempts=attempts, holding=False, last_intervention_at=now, correction_k=correction), False
 
 
 def dhw_target(
@@ -196,16 +226,23 @@ def dhw_target(
     return_fresh: bool,
     toggle_count: int,
     cycling_state: DhwCyclingState,
+    now: datetime,
     params: DhwParams = DhwParams(),
 ) -> tuple[float, DhwCyclingState, bool]:
-    """Returns (target flow, new cycling state, issue_raised)."""
-    cycling_correction, new_state, issue_raised = dhw_cycling_correction(cycling_state, toggle_count, params)
+    """Returns (target flow, new cycling state, issue_raised).
+
+    v0.2.1 review fix 4: the base (cylinder + delta) is clamped to
+    [dhw_flow_min, dhw_flow_max] *before* corrections are applied, then only
+    floored at dhw_flow_min afterwards — otherwise a -3/-5 K correction at the
+    70 °C ceiling was clamped straight back up to 70 and silently disappeared.
+    """
+    cycling_correction, new_state, issue_raised = dhw_cycling_correction(cycling_state, toggle_count, now, params)
     if new_state.holding:
         return params.dhw_flow_min, new_state, issue_raised
-    base = cylinder_temp + params.dhw_delta
+    base = clamp(cylinder_temp + params.dhw_delta, params.dhw_flow_min, params.dhw_flow_max)
     return_correction = dhw_return_correction(return_temp, return_fresh, params)
     total = base + return_correction + cycling_correction
-    return clamp(total, params.dhw_flow_min, params.dhw_flow_max), new_state, issue_raised
+    return max(params.dhw_flow_min, total), new_state, issue_raised
 
 
 # ---------------------------------------------------------------------------
@@ -221,13 +258,21 @@ def should_write(
     exempt: bool = False,
 ) -> bool:
     """True when the value differs enough and enough time has passed, or `exempt`
-    (the return ceiling, and leaving DHW mode, may act every cycle)."""
+    (the return ceiling, and leaving DHW mode, may act every cycle).
+
+    v0.2.1 review fix 1: the min-hold is gated on `last_target_change`, not
+    `last_written_at` — the latter advances on every re-assertion (change 2),
+    so under re-assertion it never stops being "recent" and a target change
+    >= hysteresis_k would be blocked forever. Falls back to `last_written_at`
+    when `last_target_change` is None (e.g. state persisted before this fix).
+    """
     if exempt:
         return True
     if memory.last_written_setpoint is None:
         return True
     if abs(new_value - memory.last_written_setpoint) < params.hysteresis_k:
         return False
-    if memory.last_written_at is not None and now - memory.last_written_at < timedelta(minutes=params.min_hold_minutes):
+    last_change = memory.last_target_change if memory.last_target_change is not None else memory.last_written_at
+    if last_change is not None and now - last_change < timedelta(minutes=params.min_hold_minutes):
         return False
     return True

@@ -59,14 +59,51 @@ def test_cycles_10min_reads_current_window_without_adding():
 
 def test_return_freshness():
     hub = BoilerFlowHub()
-    value, fresh = hub.sample_return(55.0, T0)
+    value, fresh = hub.sample_return(55.0, T0, T0)
     assert value == 55.0 and fresh
     # stale sample: no new reading for 11 minutes, but the last value is still reported
-    value, fresh = hub.sample_return(None, T0 + timedelta(minutes=11))
+    value, fresh = hub.sample_return(None, None, T0 + timedelta(minutes=11))
     assert value == 55.0 and not fresh
     # fresh again once a new reading arrives
-    value, fresh = hub.sample_return(60.0, T0 + timedelta(minutes=11))
+    value, fresh = hub.sample_return(60.0, T0 + timedelta(minutes=11), T0 + timedelta(minutes=11))
     assert value == 60.0 and fresh
+
+
+def test_return_freshness_uses_sensor_last_reported_not_poll_time():
+    # v0.2.1 review fix 5: a wedged-but-numeric sensor (last_reported frozen in
+    # the past) must go stale even though every 60 s poll sees a numeric state.
+    hub = BoilerFlowHub()
+    stuck_at = T0
+    value, fresh = hub.sample_return(55.0, stuck_at, T0)
+    assert value == 55.0 and fresh
+    # 11 "polls" later the sensor still reports the same last_reported timestamp
+    # (it is wedged), even though its state is still numeric.
+    value, fresh = hub.sample_return(55.0, stuck_at, T0 + timedelta(minutes=11))
+    assert value == 55.0 and not fresh
+
+
+def test_return_freshness_falls_back_to_now_when_no_last_reported():
+    hub = BoilerFlowHub()
+    value, fresh = hub.sample_return(55.0, None, T0)
+    assert value == 55.0 and fresh
+
+
+def test_ignitions_since_none_counts_whole_window():
+    hub = BoilerFlowHub()
+    now = T0
+    hub.record_ignition(now)
+    hub.record_ignition(now + timedelta(minutes=1))
+    assert hub.ignitions_since(None, now + timedelta(minutes=2)) == 2
+
+
+def test_ignitions_since_only_counts_after_intervention():
+    hub = BoilerFlowHub()
+    now = T0
+    hub.record_ignition(now)  # before intervention
+    intervention_at = now + timedelta(minutes=1)
+    hub.record_ignition(now + timedelta(minutes=2))  # after intervention
+    hub.record_ignition(now + timedelta(minutes=3))  # after intervention
+    assert hub.ignitions_since(intervention_at, now + timedelta(minutes=4)) == 2
 
 
 def test_write_memory_round_trip():

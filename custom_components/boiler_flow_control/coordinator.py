@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -54,6 +54,7 @@ from .const import (
     DEFAULT_OVERRIDE,
     DEFAULT_RETURN_CEILING,
     DOMAIN,
+    OVERRIDE_AUTO,
     ROOM_DESIGN_TEMP,
     UPDATE_INTERVAL_SECONDS,
 )
@@ -71,6 +72,7 @@ from .core.model import (
     CyclingGuardParams,
     DemandCorrectionParams,
     DemandCorrectionState,
+    DhwCyclingState,
     DhwParams,
     HysteresisParams,
     ManualHoldParams,
@@ -146,7 +148,11 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
         self._entry = entry
         self._store = store
         self._hub = hub
-        self._config: dict[str, Any] = {**entry.data, **entry.options}
+        # v0.2.1 review fix 9: options are the complete authoritative config once
+        # set (the options flow always submits every field, absent ones cleared);
+        # merging `{**entry.data, **entry.options}` let a key removed in options
+        # resurface from the original `entry.data`.
+        self._config: dict[str, Any] = dict(entry.options) if entry.options else dict(entry.data)
         self._enabled = True
         self._override = str(self._config.get("mode_override", DEFAULT_OVERRIDE))
         self._tunables: dict[str, float] = {
@@ -253,22 +259,33 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
     # Action
     # ------------------------------------------------------------------
 
-    async def _perform(self, decision: Decision, max_flow: float | None) -> None:
+    async def _perform(self, decision: Decision, max_flow: float | None) -> bool:
+        """Perform the write. Returns True only on a confirmed successful call.
+
+        v0.2.1 review fix 2: the call is now `blocking=True` and its result is
+        reported to the caller so `_cycle` only records the write (and thus
+        `last_target_change`/`last_written_at`) when it actually succeeded. A
+        swallowed failure previously still recorded the write, which later
+        read as a manual change (live != written, live != dial) and triggered
+        a spurious 30-minute manual hold.
+        """
         if decision.action is not Action.WRITE or decision.setpoint is None:
-            return
+            return False
         entity_id = self._config.get(CONF_FLOW_SETPOINT_ENTITY)
         if not entity_id:
-            return
+            return False
         value = decision.setpoint
         if max_flow is not None:
             value = min(value, max_flow)  # never exceed number.boiler_heatingtemp
         try:
             await self.hass.services.async_call(
-                "number", "set_value", {"entity_id": entity_id, "value": value}, blocking=False
+                "number", "set_value", {"entity_id": entity_id, "value": value}, blocking=True
             )
             _LOGGER.info("BFC: wrote %.1f to %s (%s)", value, entity_id, decision.reason)
+            return True
         except Exception:  # noqa: BLE001
             _LOGGER.warning("BFC: number.set_value failed for %s", entity_id)
+            return False
 
     # ------------------------------------------------------------------
     # Event-driven ignition counter (change 3)
@@ -287,13 +304,21 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
             return None
         return async_track_state_change_event(self.hass, entity_id, self._handle_heating_active_event)
 
+    @callback
     def _handle_heating_active_event(self, event) -> None:
+        """v0.2.1 review fixes 7-8: decorated `@callback` so HA runs this
+        synchronously on the event loop instead of dispatching it to an
+        executor thread, which raced the poll's prune of the same
+        `_toggle_times` list. Only an exact off->on transition counts as an
+        ignition — `unavailable`/`unknown` -> on and initial entity creation
+        (no `old_state`) are not ignitions and previously inflated the counter
+        on every HA/ems-esp restart."""
         new_state = event.data.get("new_state")
         old_state = event.data.get("old_state")
         if new_state is None or new_state.state != "on":
             return
-        if old_state is not None and old_state.state == "on":
-            return  # not an off->on transition
+        if old_state is None or old_state.state != "off":
+            return  # only count exact off->on transitions
         now = dt_util.utcnow()
         count = self._hub.record_ignition(now)
         # Update the published snapshot in place. We deliberately do not push a
@@ -312,6 +337,14 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
             severity=ir.IssueSeverity.WARNING,
             translation_key="dhw_cycling_unfixable",
         )
+
+    async def async_reset_dhw_cycling(self) -> None:
+        """v0.2.1 review fix 3c: clear the sticky DHW cycling hold + attempts
+        and delete the repair issue, for the "Reset DHW cycling hold" button."""
+        self._hub.set_dhw_cycling(DhwCyclingState())
+        await self._hub.async_save()
+        ir.async_delete_issue(self.hass, DOMAIN, "dhw_cycling_unfixable")
+        await self.async_request_refresh()
 
     # ------------------------------------------------------------------
     # Main cycle
@@ -349,10 +382,17 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
 
         # --- optional inputs ---------------------------------------------------
         d.current_flow = self._float_state(cfg.get(CONF_CURRENT_FLOW_ENTITY))
+        return_entity_state = self._state(cfg.get(CONF_RETURN_TEMP_ENTITY))
         return_raw = self._float_state(cfg.get(CONF_RETURN_TEMP_ENTITY))
         if cfg.get(CONF_RETURN_TEMP_ENTITY) is None:
             disabled.append("return ceiling disabled (no return temperature sensor)")
-        d.return_temperature_used, d.return_fresh = self._hub.sample_return(return_raw, now)
+        # v0.2.1 review fix 5: freshness is the sensor's own last_reported (fallback
+        # last_updated), not poll time — a wedged-but-numeric sensor previously
+        # stayed "fresh" forever because we stamped return_last_seen_at every poll.
+        return_last_reported = (
+            (return_entity_state.last_reported or return_entity_state.last_updated) if return_entity_state is not None else None
+        )
+        d.return_temperature_used, d.return_fresh = self._hub.sample_return(return_raw, return_last_reported, now)
 
         if cfg.get(CONF_HEATING_ACTIVE_ENTITY) is None:
             disabled.append("cycling guard disabled (no heating-active sensor)")
@@ -417,9 +457,27 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
         # --- heating-side physics (always computed: also the DHW-and-heating/idle park value) ---
         curve_params = self._curve_params()
         d.curve = heating_curve(d.outdoor_temp, curve_params) if d.outdoor_temp is not None else None
-        self._demand_state = demand_correction_step(self._demand_state, d.demand_filtered, now, DemandCorrectionParams())
+
+        # v0.2.1 review fixes 11-12: the demand correction only accumulates while
+        # mode is heating or dhw_and_heating; in idle/dhw it decays towards 0 at
+        # its normal cadence instead (otherwise idle saturates it at -8 and
+        # heating starts 8 K low next time). When the raw demand signal itself is
+        # unavailable (not merely filtered-and-held), the state is frozen instead
+        # of decaying, in either direction, until the sensor returns.
+        demand_valid = heat_demand_raw is not None
+        demand_for_step = d.demand_filtered if demand_valid else None
+        demand_active = mode in (Mode.HEATING, Mode.DHW_AND_HEATING)
+        self._demand_state = demand_correction_step(
+            self._demand_state, demand_for_step, now, DemandCorrectionParams(), active=demand_active
+        )
         d.demand_correction = self._demand_state.correction
-        self._return_state = return_ceiling_step(self._return_state, d.return_temperature_used, d.return_fresh, self._return_params())
+
+        # v0.2.1 review fix 6: freeze the heating return-ceiling accumulator while
+        # DHW is active — DHW has its own dhw_return_correction, and otherwise this
+        # accumulator ran against the heating ceiling (50) during every DHW charge
+        # and saturated at its -8 floor before being applied on exit.
+        if mode not in (Mode.DHW, Mode.DHW_AND_HEATING):
+            self._return_state = return_ceiling_step(self._return_state, d.return_temperature_used, d.return_fresh, self._return_params())
         d.return_correction = self._return_state.correction
         d.cycling_correction = cycling_guard_correction(d.cycles_10min, d.demand_filtered, CyclingGuardParams())
         return_over_ceiling = d.return_fresh and d.return_temperature_used is not None and d.return_temperature_used > self._tunables[CONF_RETURN_CEILING]
@@ -431,23 +489,41 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
         )
 
         # --- physical target: DHW wins when it has demand, else heating, else park at curve ---
+        # v0.2.1 review fix 11: idle parks at the bare curve value (already
+        # clamped to [flow_min, flow_max] by heating_curve), not the
+        # demand/return/cycling-corrected heating value.
         dhw_issue_raised = False
+        persist_dhw_state = self._enabled and self._override == OVERRIDE_AUTO
+        was_dhw = self._prev_mode in (Mode.DHW, Mode.DHW_AND_HEATING)
         if dhw_demand_bool and d.cylinder_temp is not None:
+            # v0.2.1 review fix 3a: only ignitions after the guard's last
+            # intervention count towards the next attempt.
+            ignitions_since_intervention = self._hub.ignitions_since(self._hub.dhw_cycling.last_intervention_at, now)
             target, new_dhw_state, dhw_issue_raised = dhw_target(
-                d.cylinder_temp, d.return_temperature_used, d.return_fresh, d.cycles_10min, self._hub.dhw_cycling, self._dhw_params()
+                d.cylinder_temp, d.return_temperature_used, d.return_fresh,
+                ignitions_since_intervention, self._hub.dhw_cycling, now, self._dhw_params()
             )
-            self._hub.set_dhw_cycling(new_dhw_state)
+            # v0.2.1 review fix 3b: only mutate/persist the cycling state when
+            # enabled and auto; in shadow/hold (or disabled) `new_dhw_state` is
+            # used for `would_write` display only, computed from a copy so
+            # observing a charge cannot poison future auto operation.
+            if persist_dhw_state:
+                self._hub.set_dhw_cycling(new_dhw_state)
         elif dhw_demand_bool:
             target = heating_value  # demanded but no cylinder reading: fall back to heating value
         else:
-            target = heating_value
+            target = d.curve if mode is Mode.IDLE else heating_value
+            # v0.2.1 review fix 3a: reset attempts once a DHW charge ends without
+            # reaching the sticky hold, so a stray attempt from one charge cannot
+            # combine with cycling in an unrelated later charge.
+            if was_dhw and persist_dhw_state and not self._hub.dhw_cycling.holding and self._hub.dhw_cycling.attempts > 0:
+                self._hub.set_dhw_cycling(DhwCyclingState())
         d.dhw_issue_raised = dhw_issue_raised
-        if dhw_issue_raised:
+        if dhw_issue_raised and persist_dhw_state:
             self._maybe_raise_dhw_issue()
 
         # Leaving DHW mode restores the heating value immediately (§3.3.4), exempt from min_hold,
         # like the return ceiling (§3.2.6).
-        was_dhw = self._prev_mode in (Mode.DHW, Mode.DHW_AND_HEATING)
         now_dhw = mode in (Mode.DHW, Mode.DHW_AND_HEATING)
         exempt_hysteresis = return_over_ceiling or (was_dhw and not now_dhw)
 
@@ -460,9 +536,15 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
         d.flow_setpoint = decision.setpoint if decision.action is Action.WRITE else decision.would_write
         d.would_write = decision.would_write
 
-        await self._perform(decision, d.max_flow)
-        if decision.action is Action.WRITE:
+        # v0.2.1 review fix 2: only record the write (and target_changed) when the
+        # service call actually succeeded — a swallowed failure previously still
+        # advanced the write memory, which later read as a manual change (live !=
+        # written, live != dial) and triggered a spurious 30-minute manual hold.
+        wrote_ok = await self._perform(decision, d.max_flow)
+        if decision.action is Action.WRITE and wrote_ok:
             self._hub.record_write(decision.setpoint, now, decision.target_changed)
+        elif decision.action is Action.WRITE:
+            _LOGGER.warning("BFC: write failed this cycle; not recording last_written_setpoint/last_target_change")
         d.last_written_setpoint = self._hub.last_written_setpoint
         d.last_write = self._hub.last_written_at
         d.last_target_change = self._hub.last_target_change
