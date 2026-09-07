@@ -32,17 +32,17 @@ class BoilerFlowHub:
     demand_filtered: float | None = None
     _last_demand_sample_at: datetime | None = field(default=None, repr=False)
 
-    # Heating-active toggle counter
-    _last_active_state: bool | None = field(default=None, repr=False)
+    # Heating-active ignition counter (change 3: event-driven, not polled)
     _toggle_times: list = field(default_factory=list, repr=False)
 
     # Return-temperature freshness
     return_last_seen_at: datetime | None = None
     last_return_value: float | None = None
 
-    # Last-write memory (manual-hold detection)
+    # Last-write memory (manual-hold detection, revert-aware re-assertion)
     last_written_setpoint: float | None = None
     last_written_at: datetime | None = None
+    last_target_change: datetime | None = None
 
     # DHW cycling guard state
     dhw_cycling: DhwCyclingState = field(default_factory=DhwCyclingState)
@@ -58,6 +58,9 @@ class BoilerFlowHub:
         at = self.store.get("last_written_at")
         parsed = dt_util.parse_datetime(str(at)) if at else None
         self.last_written_at = dt_util.as_utc(parsed) if parsed else None
+        change_at = self.store.get("last_target_change")
+        parsed_change = dt_util.parse_datetime(str(change_at)) if change_at else None
+        self.last_target_change = dt_util.as_utc(parsed_change) if parsed_change else None
         df = self.store.get("demand_filtered")
         self.demand_filtered = float(df) if df is not None else None
         attempts = self.store.get("dhw_cycling_attempts")
@@ -70,6 +73,7 @@ class BoilerFlowHub:
             return
         self.store.set("last_written_setpoint", self.last_written_setpoint)
         self.store.set("last_written_at", self.last_written_at.isoformat() if self.last_written_at else None)
+        self.store.set("last_target_change", self.last_target_change.isoformat() if self.last_target_change else None)
         self.store.set("demand_filtered", self.demand_filtered)
         self.store.set("dhw_cycling_attempts", self.dhw_cycling.attempts)
         self.store.set("dhw_cycling_holding", self.dhw_cycling.holding)
@@ -88,12 +92,19 @@ class BoilerFlowHub:
         self._last_demand_sample_at = now
         return self.demand_filtered
 
-    def sample_heating_active(self, is_active: bool | None, now: datetime) -> int:
-        """Count toggles of the heating-active flag in the trailing window (§3.2.4, §3.3.3)."""
-        if is_active is not None and self._last_active_state is not None and is_active != self._last_active_state:
-            self._toggle_times.append(now)
-        if is_active is not None:
-            self._last_active_state = is_active
+    def record_ignition(self, now: datetime) -> int:
+        """Record one off->on transition of the heating-active binary sensor
+        (change 3: event-driven, via `async_track_state_change_event` in the
+        coordinator, not the 60 s poll — the boiler can short-cycle faster than
+        once a minute, so a polled read undercounts). Returns the ignition
+        count in the trailing `CYCLING_WINDOW_MINUTES` window (§3.2.4, §3.3.3)."""
+        self._toggle_times.append(now)
+        return self.cycles_10min(now)
+
+    def cycles_10min(self, now: datetime) -> int:
+        """Current ignition count in the trailing window, pruning stale entries
+        without recording a new one (used by the coordinator's 60 s poll to read
+        the sensor value)."""
         cutoff = now - timedelta(minutes=CYCLING_WINDOW_MINUTES)
         self._toggle_times = [t for t in self._toggle_times if t >= cutoff]
         return len(self._toggle_times)
@@ -106,13 +117,23 @@ class BoilerFlowHub:
         fresh = self.return_last_seen_at is not None and now - self.return_last_seen_at < timedelta(minutes=RETURN_FRESHNESS_MINUTES)
         return self.last_return_value, fresh
 
-    def record_write(self, value: float, now: datetime) -> None:
+    def record_write(self, value: float, now: datetime, target_changed: bool = True) -> None:
+        """Record a `number.set_value` call. `target_changed` is False for a
+        re-assertion of an unchanged target (change 2): `last_written_at`
+        always advances, `last_target_change` only advances when the value
+        itself changed."""
         self.last_written_setpoint = value
         self.last_written_at = now
+        if target_changed:
+            self.last_target_change = now
         self._persist()
 
     def write_memory(self) -> WriteMemory:
-        return WriteMemory(last_written_setpoint=self.last_written_setpoint, last_written_at=self.last_written_at)
+        return WriteMemory(
+            last_written_setpoint=self.last_written_setpoint,
+            last_written_at=self.last_written_at,
+            last_target_change=self.last_target_change,
+        )
 
     def set_dhw_cycling(self, state: DhwCyclingState) -> None:
         self.dhw_cycling = state

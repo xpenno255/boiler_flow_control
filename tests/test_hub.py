@@ -27,33 +27,34 @@ def test_demand_filter_holds_value_when_input_drops_out():
     assert hub.sample_demand(None, T0 + timedelta(minutes=5)) == pytest.approx(50.0)
 
 
-def test_toggle_counter_counts_state_changes_only():
+def test_ignition_counter_counts_sub_minute_events():
+    # change 3: event-driven, so ignitions closer together than the 60 s poll
+    # interval (6 starts in 5 min observed in the field) are all counted.
     hub = BoilerFlowHub()
     now = T0
-    assert hub.sample_heating_active(False, now) == 0
-    for i in range(6):
-        now = now + timedelta(minutes=1)
-        state = i % 2 == 0  # alternate every cycle -> a toggle each time
-        count = hub.sample_heating_active(state, now)
-    assert count == 6  # six toggles inside a 10-minute window
+    for _ in range(6):
+        now = now + timedelta(seconds=10)
+        count = hub.record_ignition(now)
+    assert count == 6
 
 
-def test_toggle_counter_prunes_outside_window():
+def test_ignition_counter_prunes_outside_window():
     hub = BoilerFlowHub()
     now = T0
-    hub.sample_heating_active(False, now)
+    hub.record_ignition(now)  # ignition 1
     now = now + timedelta(minutes=1)
-    hub.sample_heating_active(True, now)  # toggle 1
-    now = now + timedelta(minutes=1)
-    hub.sample_heating_active(False, now)  # toggle 2
+    hub.record_ignition(now)  # ignition 2
     now = now + timedelta(minutes=15)  # well outside the 10-minute window
-    count = hub.sample_heating_active(True, now)  # toggle 3, but 1 & 2 have aged out
+    count = hub.record_ignition(now)  # ignition 3, but 1 & 2 have aged out
     assert count == 1
 
 
-def test_toggle_counter_ignores_missing_data():
+def test_cycles_10min_reads_current_window_without_adding():
     hub = BoilerFlowHub()
-    assert hub.sample_heating_active(None, T0) == 0
+    now = T0
+    hub.record_ignition(now)
+    assert hub.cycles_10min(now + timedelta(minutes=1)) == 1
+    assert hub.cycles_10min(now + timedelta(minutes=11)) == 0
 
 
 def test_return_freshness():
@@ -71,6 +72,17 @@ def test_return_freshness():
 def test_write_memory_round_trip():
     hub = BoilerFlowHub()
     assert hub.write_memory().last_written_setpoint is None
-    hub.record_write(52.5, T0)
+    hub.record_write(52.5, T0, target_changed=True)
     m = hub.write_memory()
-    assert m.last_written_setpoint == 52.5 and m.last_written_at == T0
+    assert m.last_written_setpoint == 52.5 and m.last_written_at == T0 and m.last_target_change == T0
+
+
+def test_write_memory_re_assert_advances_last_written_at_only():
+    hub = BoilerFlowHub()
+    hub.record_write(52.5, T0, target_changed=True)
+    later = T0 + timedelta(minutes=1)
+    hub.record_write(52.5, later, target_changed=False)
+    m = hub.write_memory()
+    assert m.last_written_setpoint == 52.5
+    assert m.last_written_at == later  # advances every re-assertion
+    assert m.last_target_change == T0  # target itself has not changed

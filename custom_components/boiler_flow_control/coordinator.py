@@ -14,6 +14,7 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -39,6 +40,7 @@ from .const import (
     CONF_OUTDOOR_TEMP_ENTITY,
     CONF_RETURN_CEILING,
     CONF_RETURN_TEMP_ENTITY,
+    CONF_ZONE_DEMAND_ENTITIES,
     DEFAULT_DESIGN_FLOW,
     DEFAULT_DESIGN_OUTDOOR,
     DEFAULT_DHW_DELTA,
@@ -77,7 +79,17 @@ from .core.model import (
     ReturnCeilingParams,
     ReturnCorrectionState,
 )
-from .core.policy import Action, Decision, ModeInputs, Override, decide_mode, decide_write, detect_manual_hold
+from .core.policy import (
+    Action,
+    Decision,
+    ModeInputs,
+    Override,
+    decide_mode,
+    decide_write,
+    detect_manual_hold,
+    infer_dhw_demand,
+    zone_max_demand,
+)
 from .hub import BoilerFlowHub
 from .store import BFCStore
 
@@ -98,6 +110,7 @@ class BFCCoordinatorData:
     last_run: datetime | None = None
     last_write: datetime | None = None
     last_written_setpoint: float | None = None
+    last_target_change: datetime | None = None
     no_boiler: bool = False
     # Target
     flow_setpoint: float | None = None  # value we did/would write
@@ -116,6 +129,8 @@ class BFCCoordinatorData:
     outdoor_temp: float | None = None
     current_flow: float | None = None
     heat_demand: float | None = None
+    aggregate_heat_demand: float | None = None
+    zone_max_demand: float | None = None
     hw_relay_demand: float | None = None
     cylinder_temp: float | None = None
     max_flow: float | None = None
@@ -255,6 +270,39 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
         except Exception:  # noqa: BLE001
             _LOGGER.warning("BFC: number.set_value failed for %s", entity_id)
 
+    # ------------------------------------------------------------------
+    # Event-driven ignition counter (change 3)
+    # ------------------------------------------------------------------
+
+    def async_subscribe_heating_active(self):
+        """Subscribe to state changes of the heating-active binary sensor so
+        every off->on transition is counted as an ignition, however close
+        together (the boiler can short-cycle faster than the 60 s poll: 6
+        starts in 5 min have been observed, which a polled read undercounts).
+        Returns the unsubscribe callable, or None if not configured; the
+        caller (async_setup_entry) registers it with `entry.async_on_unload`.
+        """
+        entity_id = self._config.get(CONF_HEATING_ACTIVE_ENTITY)
+        if not entity_id:
+            return None
+        return async_track_state_change_event(self.hass, entity_id, self._handle_heating_active_event)
+
+    def _handle_heating_active_event(self, event) -> None:
+        new_state = event.data.get("new_state")
+        old_state = event.data.get("old_state")
+        if new_state is None or new_state.state != "on":
+            return
+        if old_state is not None and old_state.state == "on":
+            return  # not an off->on transition
+        now = dt_util.utcnow()
+        count = self._hub.record_ignition(now)
+        # Update the published snapshot in place. We deliberately do not push a
+        # coordinator-wide update from here (no `async_set_updated_data`): the
+        # next 60 s poll republishes everything through the normal path, and
+        # this keeps the event listener a lightweight, synchronous counter.
+        if self.data is not None:
+            self.data.cycles_10min = count
+
     def _maybe_raise_dhw_issue(self) -> None:
         ir.async_create_issue(
             self.hass,
@@ -306,18 +354,30 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
             disabled.append("return ceiling disabled (no return temperature sensor)")
         d.return_temperature_used, d.return_fresh = self._hub.sample_return(return_raw, now)
 
-        heating_active = self._is_on(cfg.get(CONF_HEATING_ACTIVE_ENTITY))
         if cfg.get(CONF_HEATING_ACTIVE_ENTITY) is None:
             disabled.append("cycling guard disabled (no heating-active sensor)")
-        d.cycles_10min = self._hub.sample_heating_active(heating_active, now)
+        # Change 3: the ignition counter is event-driven (see async_subscribe_heating_active);
+        # the 60 s poll only reads the current window, it no longer feeds it.
+        d.cycles_10min = self._hub.cycles_10min(now)
 
         self._float_state(cfg.get(CONF_BURNER_POWER_ENTITY))  # read for future use / diagnostics only
         if cfg.get(CONF_BURNER_POWER_ENTITY) is None:
             disabled.append("burner power unavailable")
 
-        heat_demand_raw = self._float_state(cfg.get(CONF_HEAT_DEMAND_ENTITY))
-        if cfg.get(CONF_HEAT_DEMAND_ENTITY) is None:
+        # --- heating-demand signal (change 1) -----------------------------------
+        # The aggregate controller sensor (01_144444_heat_demand) includes stored-
+        # hot-water demand: it reads 100 during a DHW-only charge while every
+        # per-zone sensor reads 0. Prefer the max of the configured zone sensors
+        # (ignoring unavailable ones) so a DHW-only charge does not pollute the
+        # heating-side low-pass filter / mode detection; fall back to the
+        # aggregate sensor only when no zone list is configured.
+        zone_entities: list[str] = cfg.get(CONF_ZONE_DEMAND_ENTITIES) or []
+        aggregate_raw = self._float_state(cfg.get(CONF_HEAT_DEMAND_ENTITY))
+        d.aggregate_heat_demand = aggregate_raw
+        d.zone_max_demand = zone_max_demand([self._float_state(e) for e in zone_entities])
+        if not zone_entities and cfg.get(CONF_HEAT_DEMAND_ENTITY) is None:
             disabled.append("heating mode disabled (no aggregate heat-demand sensor)")
+        heat_demand_raw = d.zone_max_demand if zone_entities else aggregate_raw
         d.heat_demand = heat_demand_raw
         d.demand_filtered = self._hub.sample_demand(heat_demand_raw, now)
 
@@ -333,10 +393,19 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
 
         # --- mode inputs ---------------------------------------------------
         heat_demand_bool = bool(d.heat_demand and d.heat_demand > 0)
-        dhw_demand_bool = bool(d.hw_relay_demand and d.hw_relay_demand > 0)
+        relay_dhw_bool = bool(d.hw_relay_demand and d.hw_relay_demand > 0)
+        # DHW detection (change 1): relay OR inferred from the aggregate-includes-
+        # DHW signature. dhw_and_heating still requires the relay signal — see
+        # infer_dhw_demand's docstring and docs/spec.md v0.2 field findings.
+        dhw_demand_bool = infer_dhw_demand(
+            relay_demand_on=relay_dhw_bool,
+            zone_configured=bool(zone_entities),
+            aggregate_demand=aggregate_raw,
+            zone_max=d.zone_max_demand,
+        )
 
         manual_hold_active, self._manual_hold_state = detect_manual_hold(
-            d.live_setpoint, self._hub.last_written_setpoint, now, self._manual_hold_state, self._manual_hold_params()
+            d.live_setpoint, self._hub.last_written_setpoint, d.max_flow, now, self._manual_hold_state, self._manual_hold_params()
         )
         d.manual_hold_active = manual_hold_active
 
@@ -393,9 +462,10 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
 
         await self._perform(decision, d.max_flow)
         if decision.action is Action.WRITE:
-            self._hub.record_write(decision.setpoint, now)
+            self._hub.record_write(decision.setpoint, now, decision.target_changed)
         d.last_written_setpoint = self._hub.last_written_setpoint
         d.last_write = self._hub.last_written_at
+        d.last_target_change = self._hub.last_target_change
 
         self._prev_mode = mode
         d.disabled_features = disabled

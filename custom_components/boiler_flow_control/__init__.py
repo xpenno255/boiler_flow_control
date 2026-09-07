@@ -36,6 +36,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.runtime_data = coordinator
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
+    # Change 3: event-driven ignition counter, unsubscribed automatically on unload.
+    unsub_heating_active = coordinator.async_subscribe_heating_active()
+    if unsub_heating_active is not None:
+        entry.async_on_unload(unsub_heating_active)
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(async_update_options))
     return True

@@ -18,6 +18,7 @@ CONF_HEAT_DEMAND_ENTITY = "heat_demand_entity"  # sensor.01_144444_heat_demand
 CONF_HW_RELAY_DEMAND_ENTITY = "hw_relay_demand_entity"  # sensor.13_163605_relay_demand
 CONF_CYLINDER_TEMP_ENTITY = "cylinder_temp_entity"  # sensor.07_045877_temperature
 CONF_MAX_FLOW_ENTITY = "max_flow_entity"  # number.boiler_heatingtemp
+CONF_ZONE_DEMAND_ENTITIES = "zone_demand_entities"  # sensor.01_144444_0X_heat_demand (multiple)
 
 OPTIONAL_ENTITY_KEYS = (
     CONF_CURRENT_FLOW_ENTITY,
@@ -28,6 +29,7 @@ OPTIONAL_ENTITY_KEYS = (
     CONF_HW_RELAY_DEMAND_ENTITY,
     CONF_CYLINDER_TEMP_ENTITY,
     CONF_MAX_FLOW_ENTITY,
+    CONF_ZONE_DEMAND_ENTITIES,
 )
 
 # ---------------------------------------------------------------------------

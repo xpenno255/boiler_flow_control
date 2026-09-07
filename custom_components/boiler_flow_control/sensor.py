@@ -60,6 +60,8 @@ class BFCSensor(BFCEntity, SensorEntity):
                 "manual_hold_active": d.manual_hold_active,
                 "dhw_issue_raised": d.dhw_issue_raised,
                 "disabled_features": d.disabled_features,
+                "aggregate_heat_demand": d.aggregate_heat_demand,
+                "zone_max_demand": d.zone_max_demand,
             }
         if self._key == "flow_setpoint":
             return {
@@ -72,4 +74,6 @@ class BFCSensor(BFCEntity, SensorEntity):
             }
         if self._key == "return_temperature_used":
             return {"fresh": d.return_fresh}
+        if self._key == "last_write":
+            return {"last_target_change": d.last_target_change}
         return None

@@ -27,6 +27,7 @@ from .const import (
     CONF_MIN_HOLD_MINUTES,
     CONF_OUTDOOR_TEMP_ENTITY,
     CONF_RETURN_TEMP_ENTITY,
+    CONF_ZONE_DEMAND_ENTITIES,
     DEFAULT_DHW_FLOW_MAX,
     DEFAULT_DHW_FLOW_MIN,
     DEFAULT_DHW_RETURN_CEILING,
@@ -62,7 +63,7 @@ def _flatten(user_input: dict) -> dict:
 
 def _strip_empty(flat: dict, keys: tuple[str, ...]) -> dict:
     for key in keys:
-        if key in flat and (flat[key] is None or flat[key] == ""):
+        if key in flat and (flat[key] is None or flat[key] == "" or flat[key] == []):
             flat.pop(key)
     return flat
 
@@ -84,6 +85,9 @@ def entities_schema(d: dict[str, Any] | None = None) -> vol.Schema:
                         vol.Optional(CONF_HW_RELAY_DEMAND_ENTITY, description={"suggested_value": d.get(CONF_HW_RELAY_DEMAND_ENTITY)}): _entity("sensor"),
                         vol.Optional(CONF_CYLINDER_TEMP_ENTITY, description={"suggested_value": d.get(CONF_CYLINDER_TEMP_ENTITY)}): _entity("sensor"),
                         vol.Optional(CONF_MAX_FLOW_ENTITY, description={"suggested_value": d.get(CONF_MAX_FLOW_ENTITY)}): _entity("number"),
+                        vol.Optional(
+                            CONF_ZONE_DEMAND_ENTITIES, description={"suggested_value": d.get(CONF_ZONE_DEMAND_ENTITIES)}
+                        ): selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor", multiple=True)),
                     }
                 )
             ),

@@ -129,10 +129,17 @@ class HysteresisParams:
 
 @dataclass(frozen=True)
 class WriteMemory:
-    """What we last wrote, persisted by the coordinator (survives restart)."""
+    """What we last wrote, persisted by the coordinator (survives restart).
+
+    `last_written_at` advances on every write call, including re-assertions of
+    an unchanged target (change 2, v0.2: the boiler decays a written flow
+    setpoint back to the dial value within ~2 min if nothing rewrites it).
+    `last_target_change` only advances when the TARGET value itself changes.
+    """
 
     last_written_setpoint: float | None = None
     last_written_at: datetime | None = None
+    last_target_change: datetime | None = None
 
 
 # ---------------------------------------------------------------------------
