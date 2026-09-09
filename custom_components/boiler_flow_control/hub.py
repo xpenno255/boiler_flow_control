@@ -20,6 +20,9 @@ from .store import BFCStore
 _LOGGER = logging.getLogger(__name__)
 
 DEMAND_FILTER_TAU_MINUTES = 10.0
+# Below this the EMA is indistinguishable from zero demand; snap so the
+# sensor doesn't sit on denormal residue (e.g. 2.8e-148) for hours.
+DEMAND_FILTER_ZERO_SNAP = 0.1
 
 
 @dataclass
@@ -99,6 +102,8 @@ class BoilerFlowHub:
             dt_s = (now - self._last_demand_sample_at).total_seconds() if self._last_demand_sample_at else 60.0
             alpha = dt_s / (DEMAND_FILTER_TAU_MINUTES * 60.0 + dt_s)
             self.demand_filtered += alpha * (raw - self.demand_filtered)
+            if raw == 0.0 and self.demand_filtered < DEMAND_FILTER_ZERO_SNAP:
+                self.demand_filtered = 0.0
         self._last_demand_sample_at = now
         return self.demand_filtered
 

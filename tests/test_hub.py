@@ -27,6 +27,23 @@ def test_demand_filter_holds_value_when_input_drops_out():
     assert hub.sample_demand(None, T0 + timedelta(minutes=5)) == pytest.approx(50.0)
 
 
+def test_demand_filter_snaps_to_zero_instead_of_decaying_forever():
+    hub = BoilerFlowHub()
+    hub.sample_demand(50.0, T0)
+    now = T0
+    for _ in range(120):  # two hours of zero demand at 1-minute samples
+        now = now + timedelta(minutes=1)
+        value = hub.sample_demand(0.0, now)
+    assert value == 0.0
+
+
+def test_demand_filter_zero_snap_only_when_raw_is_zero():
+    hub = BoilerFlowHub()
+    hub.sample_demand(0.05, T0)
+    value = hub.sample_demand(0.05, T0 + timedelta(minutes=1))
+    assert value == pytest.approx(0.05)
+
+
 def test_ignition_counter_counts_sub_minute_events():
     # change 3: event-driven, so ignitions closer together than the 60 s poll
     # interval (6 starts in 5 min observed in the field) are all counted.
