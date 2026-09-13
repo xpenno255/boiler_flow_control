@@ -1,4 +1,5 @@
 """Sensors for Boiler Flow Control (§4)."""
+
 from __future__ import annotations
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
@@ -22,6 +23,9 @@ SENSORS: list[tuple[str, str, tuple, str | None, bool]] = [
     ("return_temperature_used", "Return Temperature Used", TEMP, None, True),
     ("cycles_10min", "Cycles (10 min)", COUNT, "mdi:sync-alert", True),
     ("demand_filtered", "Heat Demand Filtered", PERCENT, "mdi:radiator", True),
+    ("cycling_status", "Cycling Status", PLAIN, "mdi:sync-alert", True),
+    ("dhw_status", "DHW Status", PLAIN, "mdi:water-boiler", True),
+    ("last_burn_seconds", "Last Burn Duration", ("s", SensorDeviceClass.DURATION, None), "mdi:fire", True),
     ("last_write", "Last Write", (None, SensorDeviceClass.TIMESTAMP, None), None, True),
 ]
 
@@ -62,6 +66,9 @@ class BFCSensor(BFCEntity, SensorEntity):
                 "disabled_features": d.disabled_features,
                 "aggregate_heat_demand": d.aggregate_heat_demand,
                 "zone_max_demand": d.zone_max_demand,
+                "dhw_active": d.dhw_active,
+                "dhw_source": d.dhw_source,
+                "write_status": d.write_status,
             }
         if self._key == "flow_setpoint":
             return {
@@ -71,6 +78,31 @@ class BFCSensor(BFCEntity, SensorEntity):
                 "cycling_correction": d.cycling_correction,
                 "reason": d.reason,
                 "would_write": d.would_write,
+                "requested_target": d.requested_target,
+                "sent_target": d.last_written_setpoint,
+                "confirmed_target": d.confirmed_setpoint,
+                "write_status": d.write_status,
+                "room_correction": d.room_correction,
+                "room_error": d.room_error,
+            }
+        if self._key == "dhw_status":
+            return {
+                "active": d.dhw_active,
+                "source": d.dhw_source,
+                "cylinder_target": d.cylinder_target,
+                "charge_minutes": d.dhw_charge_minutes,
+                "starts_this_charge": d.dhw_charge_starts,
+            }
+        if self._key == "cycling_status":
+            return {
+                "starts_10min": d.cycles_10min,
+                "last_stop_reason": d.last_stop_reason,
+                "burner_power": d.burner_power,
+                "last_firing_power": self.coordinator._hub.last_burner_power,
+                "current_flow": d.current_flow,
+                "live_setpoint": d.live_setpoint,
+                "return_temperature": d.return_temperature_used,
+                "return_fresh": d.return_fresh,
             }
         if self._key == "return_temperature_used":
             return {"fresh": d.return_fresh}

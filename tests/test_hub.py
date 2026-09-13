@@ -1,4 +1,5 @@
 """Tests for hub.py: demand low-pass filter, toggle counter, return freshness, write memory."""
+
 from datetime import datetime, timedelta, timezone
 
 import pytest

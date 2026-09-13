@@ -3,6 +3,7 @@
 Nothing here touches Home Assistant. `curve.py` operates on these types to produce
 a flow-temperature target; `policy.py` decides the mode and whether to write it.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -67,14 +68,16 @@ class DemandCorrectionState:
 @dataclass(frozen=True)
 class ReturnCeilingParams:
     return_ceiling: float = 50.0
-    step_k: float = 2.0
+    step_k: float = 0.2  # K per minute
+    deadband_k: float = 1.0
     freshness_minutes: float = 10.0
-    floor_k: float = -20.0  # safety bound: how far this correction may push down
+    floor_k: float = -6.0  # bounded efficiency trim
 
 
 @dataclass(frozen=True)
 class ReturnCorrectionState:
     correction: float = 0.0
+    sampled_at: datetime | None = None
 
 
 # ---------------------------------------------------------------------------

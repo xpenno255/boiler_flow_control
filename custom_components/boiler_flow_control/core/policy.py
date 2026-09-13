@@ -5,14 +5,15 @@ Pure functions over plain inputs. The coordinator gathers the inputs from Home
 Assistant, calls `decide_mode` then `decide_write`, and performs at most one
 `number.set_value` call.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 
-from .model import HysteresisParams, ManualHoldParams, ManualHoldState, Mode, WriteMemory
 from .curve import should_write
+from .model import HysteresisParams, ManualHoldParams, ManualHoldState, Mode, WriteMemory
 
 
 class Action(str, Enum):
@@ -63,6 +64,7 @@ def infer_dhw_demand(
     aggregate_demand: float | None,
     zone_max: float | None,
     aggregate_threshold: float = 90.0,
+    all_zones_valid: bool = True,
 ) -> bool:
     """DHW detection. The HW relay sensor (13:163605) misses some charges over
     RF, so it cannot be the sole DHW signal. When a zone list is configured we
@@ -78,7 +80,7 @@ def infer_dhw_demand(
     """
     if relay_demand_on:
         return True
-    if not zone_configured or aggregate_demand is None or zone_max is None:
+    if not all_zones_valid or not zone_configured or aggregate_demand is None or zone_max is None:
         return False
     return aggregate_demand >= aggregate_threshold and zone_max == 0.0
 
@@ -171,25 +173,15 @@ def decide_write(
     if mode is Mode.MANUAL_HOLD:
         return Decision(mode, Action.NONE, None, "manual hold: selflowtemp set by hand", target, memory)
 
-    would_write = target
-    if override is Override.HOLD:
-        return Decision(mode, Action.NONE, None, "override: hold", would_write, memory)
-    if override is Override.SHADOW:
-        return Decision(mode, Action.NONE, None, "shadow mode", would_write, memory)
-
-    # override is AUTO from here; the only remaining modes are HEATING, DHW,
-    # DHW_AND_HEATING and IDLE (parked at the curve value) — all of which must
-    # keep re-asserting the setpoint every cycle.
     target_changed = should_write(target, memory, now, hysteresis_params, exempt=exempt_hysteresis)
-    if target_changed:
-        write_value = target
-        new_memory = WriteMemory(last_written_setpoint=target, last_written_at=now, last_target_change=now)
-        reason = f"mode={mode.value}"
-    else:
-        write_value = memory.last_written_setpoint if memory.last_written_setpoint is not None else target
-        new_memory = WriteMemory(
-            last_written_setpoint=write_value, last_written_at=now, last_target_change=memory.last_target_change
-        )
-        reason = f"mode={mode.value}; re-asserting unchanged target (boiler decays it otherwise)"
-
-    return Decision(mode, Action.WRITE, write_value, reason, would_write, new_memory, target_changed=target_changed)
+    write_value = target if target_changed or memory.last_written_setpoint is None else memory.last_written_setpoint
+    new_memory = WriteMemory(
+        last_written_setpoint=write_value,
+        last_written_at=now,
+        last_target_change=now if target_changed else memory.last_target_change,
+    )
+    reason = f"mode={mode.value}" if target_changed else f"mode={mode.value}; re-asserting unchanged target"
+    if override is not Override.AUTO:
+        # The caller maintains separate virtual memory for shadow operation.
+        return Decision(mode, Action.NONE, None, f"{override.value}: {reason}", write_value, memory, target_changed)
+    return Decision(mode, Action.WRITE, write_value, reason, write_value, new_memory, target_changed)

@@ -1,105 +1,72 @@
+<p align="center"><img src="custom_components/boiler_flow_control/brand/icon@2x.png" width="160" alt="Boiler Flow Control icon"></p>
+
 # Boiler Flow Control
 
-Phase 1 of a Home Assistant custom integration that sets the boiler's flow-temperature
-setpoint dynamically (weather compensation + demand/return corrections for space heating,
-a cylinder-matched target for DHW) so ems-esp runs long, low-modulation, condensing burns
-instead of short cycles. Full behavioural spec: `docs/spec.md`.
+A Home Assistant integration that supervises an EMS-ESP boiler's **flow-temperature setpoint**. It combines weather compensation with demand or optional room feedback, while handling stored hot water separately. Evohome and the boiler retain control of their relays, pump and burner.
 
-## What it does
+## Upgrade to 0.3.0
 
-- **Heating**: weather-compensation curve (design flow 55 °C at design outdoor −3 °C),
-  corrected by a low-pass-filtered heat-demand signal, a return-temperature ceiling, and a
-  cycling guard, clamped to `flow_min`/`flow_max`. The demand signal is the max of the
-  configured per-zone demand sensors (`zone_demand_entities`), or the aggregate controller
-  sensor if no zone list is configured — the aggregate includes stored-hot-water demand and
-  would otherwise read high through a DHW-only charge.
-- **DHW**: target flow = cylinder temperature + `dhw_delta`, clamped to
-  `dhw_flow_min`/`dhw_flow_max`, with its own return ceiling and cycling guard. DHW is
-  detected from the HW relay demand, or inferred (when a zone list is configured) from the
-  aggregate-includes-DHW signature: aggregate ≥ 90 while every zone reads 0 — the relay
-  sensor misses some charges over RF. `dhw_and_heating` still requires the relay signal;
-  the inference cannot separate it from plain high heating demand. If the cycling guard
-  fails twice it holds at `dhw_flow_min` and raises a repair issue — the coil/pump/minimum
-  burner power need attention, software cannot fix it. Use the **"Reset DHW cycling
-  hold"** button to clear the hold + attempt counter and dismiss the repair issue once the
-  underlying issue has been addressed (or to retry after a false trip).
-- Detects a manual change to the flow-setpoint entity and holds off for `manual_hold_minutes`.
-  A live value that reverts to the current max-flow (dial) value is never treated as manual
-  — the boiler decays an un-rewritten setpoint back to the dial by itself.
-- In auto mode, writes `number.set_value` **every cycle** (60 s) while the mode is
-  `heating`/`dhw`/`dhw_and_heating`, and when idle (parked at the curve value) — the boiler
-  reverts the setpoint to the dial value within ~2 min if nothing rewrites it. Hysteresis
-  and `min_hold_minutes` govern only when the *target* may change (except the return
-  ceiling and leaving DHW mode, which may change it every cycle); shadow mode still writes
-  nothing.
-- Never exceeds the configured max-flow number.
-- Counts boiler ignitions (off→on transitions of the heating-active sensor) event-driven,
-  not from the 60 s poll, so it does not undercount short-cycling faster than once a minute.
+Install **0.3.0** through HACS and restart Home Assistant. Existing entity IDs, weather-curve settings and mode selection are retained. Requires Home Assistant **2026.3 or newer**; tested on 2026.9.0.
 
-## Shadow-first rollout
+- Automatic cycling temperature reductions and the permanent 55°C DHW hold have been removed. An old cycling hold is cleared automatically during upgrade.
+- DHW has a configurable **cylinder target**, default **60°C**. Check this matches your cylinder controller. You can select its live target entity to follow schedule/hygiene target changes.
+- **DHW fallback flow** defaults to your existing DHW flow ceiling (normally 70°C). Confirm it is appropriate for your boiler and cylinder. The integration never increases the boiler's maximum setting.
+- Existing `dhw_return_ceiling` settings are retired and ignored. A high return alone does not justify reducing cylinder heat transfer.
+- The existing reset button retains its unique ID; its new display name is **Reset DHW diagnostics**.
+- Room feedback is optional. The original weather curve remains the starting point.
 
-`select.bfc_mode_override` defaults to **shadow**: every cycle computes and exposes what it
-*would* write (`sensor.bfc_flow_setpoint.would_write`), but nothing is sent to the boiler.
-Watch it for a while, then switch to **auto** to let it write, or **hold** to freeze
-writes without disabling the integration.
+New installations start in **shadow** mode. An upgrade preserves the restored auto/shadow/hold selection.
 
-## Entities
+## Behaviour
 
-- `sensor.bfc_mode` — `idle` / `heating` / `dhw` / `dhw_and_heating` / `manual_hold` / `off` /
-  `no_boiler`, with `reason`, `disabled_features` and manual-hold/DHW-issue flags as attributes.
-- `sensor.bfc_flow_setpoint` — the value written or that would be written; attributes: `curve`,
-  `demand_correction`, `return_correction`, `cycling_correction`, `reason`, `would_write`.
-- `sensor.bfc_return_temperature_used`, `sensor.bfc_cycles_10min`, `sensor.bfc_heat_demand_filtered`,
-  `sensor.bfc_last_write` (attribute `last_target_change`: when the target value itself last changed,
-  as distinct from `last_write`, which advances every re-assertion in auto mode).
-- `switch.bfc_enabled`, `select.bfc_mode_override` (auto / shadow / hold).
-- `number.bfc_design_flow`, `number.bfc_design_outdoor`, `number.bfc_return_ceiling`, `number.bfc_dhw_delta`.
-- `button.bfc_reset_dhw_cycling_hold` — clears the sticky DHW cycling hold + attempt
-  counter and deletes the `dhw_cycling_unfixable` repair issue.
+**Space heating:** the original radiator-exponent weather curve (55°C at −3°C outdoors, by default), bounded by your heating floor/ceiling. Without room inputs, sustained zone demand adjusts the curve by up to ±8 K. With configured room thermostats, slow room recovery can add up to 8 K instead. Return temperature provides a small efficiency trim only after five minutes of heating with circulation evidence: filtered input, a ±1 K deadband, 0.2 K/minute and a maximum −6 K trim. Cold-room or high-demand pressure suppresses the negative trim; stale return data removes it.
 
-## Configuration
+**Stored hot water:** normally follows cylinder temperature plus the DHW delta, with at least 5 K requested headroom above the cylinder target and the configured DHW floor/ceiling. Missing cylinder readings use the DHW fallback, never the weather curve. Both entering and leaving DHW bypass the heating hold. Missing readings, inadequate progress (less than 1 K over 30 minutes by default), a charge exceeding 120 minutes, or insufficient flow headroom produce diagnostics. Poor progress/timeout uses the fallback until the charge ends or diagnostics are reset. These are supervisory indications; draw-off and sensor position can affect apparent progress.
 
-Set up via **Settings → Devices & Services → Add Integration → Boiler Flow Control**.
-Required: the flow-setpoint number and an outdoor-temperature sensor. Everything else
-(current flow, return temperature, heating-active flag, burner power, aggregate heat
-demand, HW relay demand, cylinder temperature, max-flow number, zone demand sensors) is
-optional; each missing input disables the feature that needs it and is listed on
-`sensor.bfc_mode`.
+**Cycling:** counts exact off→on events and records the last observed burn duration. An optional appliance-relay input helps distinguish a requested stop from a possible temperature-limit stop. Frequent starts are **diagnostic only**. A count alone cannot establish whether flow should rise or fall. Validate the selected heating-active signal against flame state or the boiler's burner-start counter on your installation.
 
-`zone_demand_entities` (a multi-entity selector, sensor domain) lets you list the
-per-zone heat-demand sensors (e.g. `sensor.01_144444_0X_heat_demand`). When set, it
-replaces the aggregate sensor as the heating-demand signal and enables DHW-only-charge
-inference for houses where the HW relay sensor misses charges over RF.
+**Inputs and mode detection:** configured zones replace the aggregate heating demand because the aggregate may include DHW. Inferring DHW requires every configured zone to be fresh and zero, aggregate demand ≥90%, and two minutes of sustained evidence. A positive HW relay signal is immediate. Brief missing evidence has a two-minute grace period; a confirmed relay-off with aggregate below 90 ends DHW immediately. Demand/cylinder readings expire after 30 minutes by default, outdoor readings after 120, and return readings after 10. Static target and maximum-flow settings do not expire merely because they are unchanged.
 
-The owner's real entity ids (see `docs/spec.md` §2), for reference when configuring:
+**Writes:** auto reasserts the effective target every minute because this installation's EMS setpoint otherwise reverts to the front-panel setting. Target changes normally have a 10-minute hold and 1 K hysteresis. Limits and number-entity step are resolved before writing and recording the value. Delayed readback is reported separately from service success. A configured maximum-flow entity becoming unavailable, or contradictory entity/configuration limits, suspends writes. Existing boiler hardware limits remain in force.
 
-| Input | Entity |
+**Shadow:** uses the same limits and target arbitration with separate virtual memory; no boiler writes. It models decisions, not the boiler's hypothetical thermal response. Hold disables writes. Manual changes after a confirmed write trigger the configured manual-hold interval; a return to the known dial setting is treated as the boiler's normal fallback.
+
+## Setup and entities
+
+Add through **Settings → Devices & Services → Add Integration → Boiler Flow Control**. Configure the flow-setpoint number and outdoor sensor, then the optional inputs. Edit these later through the integration's options.
+
+Typical entities in this installation:
+
+| Input | Example |
 |---|---|
 | Flow setpoint | `number.boiler_selflowtemp` |
-| Outdoor temperature | `sensor.met_office_weoley_castle_temperature` |
+| Outdoor | `sensor.met_office_weoley_castle_temperature` |
 | Current flow | `sensor.boiler_curflowtemp` |
-| Return temperature | `sensor.boiler_return_temp_temperature` |
-| Heating active | `binary_sensor.boiler_heatingactive` |
+| Return | `sensor.boiler_return_temp_temperature` |
+| Burner/heating active | `binary_sensor.boiler_heatingactive` |
 | Burner power | `sensor.boiler_curburnpow` |
-| Aggregate heat demand | `sensor.01_144444_heat_demand` |
+| Aggregate demand | `sensor.01_144444_heat_demand` |
 | HW relay demand | `sensor.13_163605_relay_demand` |
 | Cylinder temperature | `sensor.07_045877_temperature` |
-| Max flow | `number.boiler_heatingtemp` |
+| Boiler maximum | `number.boiler_heatingtemp` |
 
-The remaining tunables (`flow_min`, `flow_max`, `dhw_flow_min`, `dhw_flow_max`,
-`dhw_return_ceiling`, `min_hold_minutes`, `manual_hold_minutes`) live in the options flow.
-Submitting the options flow replaces the whole configuration: clearing an optional entity
-there removes it for good (it will not resurface from the original setup on a later
-reload), and `flow_min`/`dhw_flow_min` must not be set above their matching
-`flow_max`/`dhw_flow_max` — the form rejects that with an error.
+Disable the existing automation that writes the same flow setpoint before using auto, so there is one controller for that number.
 
-**Before switching to auto**, disable the owner's existing "ramp to 70 °C on DHW"
-automation — otherwise the two fight over the same flow setpoint (§3.4).
+Diagnostics include Mode, Flow Setpoint, Return Temperature Used, Cycles (10 min), Cycling Status, Last Burn Duration, DHW Status, Heat Demand Filtered and Last Write. Flow Setpoint attributes separate **requested**, **effective/would-write**, **sent** and **confirmed** targets. A confirmed target is the most recent matching setpoint readback, not proof of actual water temperature.
+
+The new **DHW Active** binary sensor (normally `binary_sensor.boiler_flow_control_dhw_active`) shares the resolved DHW signal. Select it as the DHW gate in the companion `ot_thermostat_control` integration if that currently relies on the unreliable raw relay. It is on during DHW-only and mixed operation; this release does not change the companion integration automatically.
 
 ## Development
 
+```bash
+python3.14 -m venv .venv
+.venv/bin/pip install -r requirements-test.txt
+.venv/bin/python -m pytest -q
+.venv/bin/ruff check custom_components tests scripts
+.venv/bin/ruff format --check custom_components tests scripts
+.venv/bin/python scripts/build_release.py
 ```
-pip install -r requirements-test.txt  # or use the ot_thermostat_control venv
-pytest
-python -m compileall custom_components
-```
+
+The archive contains only the integration files, including its local brand images. The original editable icon is in `assets/icon.svg`; regenerate the two PNG sizes with `scripts/build_icon.py` after installing CairoSVG.
+
+See [the current specification](docs/spec.md), [release notes](CHANGELOG.md), and [the pre-change review](docs/review_20260913.md). Lower gas use must be established through comparable measurements of gas, comfort and hot-water service; fewer starts alone do not prove a saving.

@@ -1,7 +1,9 @@
 """Constants and defaults for Boiler Flow Control (spec v0.1)."""
+
 from __future__ import annotations
 
 DOMAIN = "boiler_flow_control"
+VERSION = "0.3.0"
 
 # ---------------------------------------------------------------------------
 # Configured entities (§5) — required
@@ -89,3 +91,20 @@ UPDATE_INTERVAL_SECONDS = 60
 RETURN_FRESHNESS_MINUTES = 10.0
 CYCLING_WINDOW_MINUTES = 10.0
 CYCLING_TOGGLE_THRESHOLD = 3
+
+# v0.3 completion, input validity and diagnostic feedback.
+CONF_CYLINDER_TARGET_ENTITY = "cylinder_target_entity"
+CONF_ROOM_CLIMATE_ENTITIES = "room_climate_entities"
+CONF_BOILER_RELAY_ENTITY = "boiler_relay_entity"
+CONF_DHW_FALLBACK_FLOW = "dhw_fallback_flow"
+CONF_DHW_TARGET = "dhw_target"
+CONF_DHW_PROGRESS_MINUTES = "dhw_progress_minutes"
+CONF_DHW_TIMEOUT_MINUTES = "dhw_timeout_minutes"
+CONF_INPUT_FRESHNESS_MINUTES = "input_freshness_minutes"
+CONF_OUTDOOR_FRESHNESS_MINUTES = "outdoor_freshness_minutes"
+DEFAULT_DHW_TARGET = 60.0
+DEFAULT_DHW_PROGRESS_MINUTES = 30.0
+DEFAULT_DHW_TIMEOUT_MINUTES = 120.0
+DEFAULT_INPUT_FRESHNESS_MINUTES = 30.0
+DEFAULT_OUTDOOR_FRESHNESS_MINUTES = 120.0
+OPTIONAL_ENTITY_KEYS += (CONF_CYLINDER_TARGET_ENTITY, CONF_ROOM_CLIMATE_ENTITIES, CONF_BOILER_RELAY_ENTITY)

@@ -1,8 +1,8 @@
 """Tests for core.curve: heating curve, corrections, DHW target, hysteresis (spec §3.2, §3.3)."""
+
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
 from core.curve import (
     clamp,
     cycling_guard_correction,
@@ -17,13 +17,9 @@ from core.curve import (
 )
 from core.model import (
     CurveParams,
-    CyclingGuardParams,
     DemandCorrectionParams,
     DemandCorrectionState,
     DhwCyclingState,
-    DhwParams,
-    HysteresisParams,
-    ReturnCeilingParams,
     ReturnCorrectionState,
     WriteMemory,
 )
@@ -180,36 +176,35 @@ def test_demand_none_still_freezes_regardless_of_active():
 # --- return ceiling, heating (§3.2.3) ---------------------------------------
 
 
-def test_return_ceiling_unavailable_or_stale_freezes():
-    s = ReturnCorrectionState(correction=-4.0)
-    assert return_ceiling_step(s, None, True) == s
-    assert return_ceiling_step(s, 55.0, False) == s
+def test_return_ceiling_stale_removes_old_penalty():
+    state = ReturnCorrectionState(-4, T0)
+    assert return_ceiling_step(state, None, False, now=T0).correction == 0
 
 
-def test_return_ceiling_acts_every_cycle_no_gate():
-    s = ReturnCorrectionState()
-    s = return_ceiling_step(s, 55.0, True)
-    assert s.correction == pytest.approx(-2.0)
-    s = return_ceiling_step(s, 55.0, True)
-    assert s.correction == pytest.approx(-4.0)
+def test_return_ceiling_elapsed_time_not_refresh_count():
+    state = return_ceiling_step(ReturnCorrectionState(), 55, True, now=T0)
+    assert state.correction == 0
+    for _ in range(10):
+        state = return_ceiling_step(state, 55, True, now=T0)
+    assert state.correction == 0
+    state = return_ceiling_step(state, 55, True, now=T0 + timedelta(minutes=1))
+    assert state.correction == pytest.approx(-0.2)
 
 
-def test_return_ceiling_recovers_once_below():
-    s = ReturnCorrectionState(correction=-4.0)
-    s = return_ceiling_step(s, 45.0, True)
-    assert s.correction == pytest.approx(-2.0)
-    s = return_ceiling_step(s, 45.0, True)
-    assert s.correction == pytest.approx(0.0)
-    s = return_ceiling_step(s, 45.0, True)
-    assert s.correction == pytest.approx(0.0)  # does not overshoot above 0
+def test_return_ceiling_deadband_recovery_and_comfort():
+    state = ReturnCorrectionState(-4, T0)
+    assert return_ceiling_step(state, 50.5, True, now=T0 + timedelta(minutes=1)).correction == -4
+    assert return_ceiling_step(state, 45, True, now=T0 + timedelta(minutes=1)).correction == pytest.approx(-3.8)
+    assert return_ceiling_step(
+        state, 60, True, now=T0 + timedelta(minutes=1), comfort_limited=True
+    ).correction == pytest.approx(-3.8)
 
 
-def test_return_ceiling_respects_floor():
-    p = ReturnCeilingParams(floor_k=-3.0, step_k=2.0)
-    s = ReturnCorrectionState()
-    for _ in range(5):
-        s = return_ceiling_step(s, 60.0, True, p)
-    assert s.correction == pytest.approx(-3.0)
+def test_return_ceiling_floor_and_long_gap_cap():
+    state = ReturnCorrectionState(-5.9, T0)
+    assert return_ceiling_step(state, 60, True, now=T0 + timedelta(hours=1)).correction == -6
+    state = ReturnCorrectionState(0, T0)
+    assert return_ceiling_step(state, 60, True, now=T0 + timedelta(hours=1)).correction == pytest.approx(-0.4)
 
 
 # --- cycling guard, heating (§3.2.4) -----------------------------------------
@@ -223,12 +218,12 @@ def test_cycling_guard_high_demand_does_nothing():
     assert cycling_guard_correction(4, 80.0) == 0.0
 
 
-def test_cycling_guard_low_demand_applies_penalty():
-    assert cycling_guard_correction(4, 20.0) == pytest.approx(-3.0)
+def test_cycling_guard_low_demand_is_diagnostic():
+    assert cycling_guard_correction(4, 20.0) == 0
 
 
-def test_cycling_guard_no_demand_data_applies_penalty():
-    assert cycling_guard_correction(4, None) == pytest.approx(-3.0)
+def test_cycling_guard_no_demand_data_does_not_guess():
+    assert cycling_guard_correction(4, None) == 0
 
 
 # --- heating_target composition ----------------------------------------------
@@ -264,91 +259,35 @@ def test_dhw_target_basic_clamped():
     assert value3 == pytest.approx(65.0)  # 45+20=65, within bounds
 
 
-def test_dhw_target_correction_applied_after_clamp_not_before():
-    # v0.2.1 review fix 4: at the dhw_flow_max ceiling, a return-ceiling
-    # correction must actually reduce the target, not vanish because the
-    # pre-correction sum was reclamped back up to the ceiling.
-    value, _, _ = dhw_target(55.0, 65.0, True, 0, DhwCyclingState(), T0)
-    # base = clamp(55+20, 55, 70) = 70; return correction -3 => 67, not 70.
-    assert value == pytest.approx(67.0)
+def test_dhw_high_return_does_not_reduce_charge_target():
+    value, _, _ = dhw_target(55, 65, True, 4, DhwCyclingState(), T0)
+    assert value == 70
+    assert dhw_return_correction(65, True) == 0
 
 
-def test_dhw_return_correction_only_when_fresh_and_over_ceiling():
-    assert dhw_return_correction(65.0, True) == pytest.approx(-3.0)
-    assert dhw_return_correction(55.0, True) == 0.0
-    assert dhw_return_correction(65.0, False) == 0.0
-    assert dhw_return_correction(None, True) == 0.0
+@pytest.mark.parametrize(
+    "state", [DhwCyclingState(), DhwCyclingState(attempts=1, correction_k=-5), DhwCyclingState(holding=True)]
+)
+def test_dhw_cycling_is_diagnostic_and_legacy_hold_clears(state):
+    correction, updated, issue = dhw_cycling_correction(state, 6, T0)
+    assert correction == 0 and not issue
+    assert updated == DhwCyclingState()
+    value, updated, issue = dhw_target(60, None, False, 6, state, T0)
+    assert value == 70 and not updated.holding and not issue
 
 
-def test_dhw_cycling_first_episode_then_second_holds_and_raises_issue():
-    state = DhwCyclingState()
-    correction, state, issue = dhw_cycling_correction(state, 4, T0)
-    assert correction == pytest.approx(-5.0) and not issue and not state.holding
-    assert state.last_intervention_at == T0
-    correction, state, issue = dhw_cycling_correction(state, 4, T0 + timedelta(minutes=15))
-    assert issue and state.holding and correction == 0.0
-    # sticky: still holding even if cycling has stopped
-    correction, state, issue = dhw_cycling_correction(state, 0, T0 + timedelta(minutes=30))
-    assert state.holding and not issue
+def test_dhw_missing_sensor_uses_fallback_not_heating():
+    value, _, _ = dhw_target(None, None, False, 0, DhwCyclingState(), T0)
+    assert value == 70
+    value, _, _ = dhw_target(None, None, False, 0, DhwCyclingState(), T0, fallback=68)
+    assert value == 68
 
 
-def test_dhw_cycling_quiet_poll_preserves_attempts_and_correction():
-    # A quiet poll mid-episode must not drop the intervention: the -5 K keeps
-    # holding the flow down and the attempt stays counted while we wait to see
-    # whether new ignitions accrue. Reset happens at charge end (coordinator).
-    state = DhwCyclingState(attempts=1, last_intervention_at=T0, correction_k=-5.0)
-    correction, state, issue = dhw_cycling_correction(state, 0, T0 + timedelta(seconds=60))
-    assert correction == pytest.approx(-5.0) and state.attempts == 1 and not state.holding and not issue
-
-
-def test_dhw_target_holds_at_floor_after_second_cycling_failure():
-    state = DhwCyclingState()
-    _, state, _ = dhw_target(40.0, None, False, 5, state, T0)
-    value, state, issue = dhw_target(40.0, None, False, 5, state, T0 + timedelta(minutes=15))
-    assert issue and value == pytest.approx(55.0) and state.holding
-
-
-# --- DHW cycling episode semantics (v0.2.1 review fix 3a) --------------------
-
-
-def test_dhw_cycling_only_ignitions_after_intervention_count():
-    # Simulates the coordinator passing ignitions-since-last-intervention:
-    # the same stale count sitting in the window (as `cycles_10min` would
-    # report every poll) must not keep re-triggering attempts.
-    state = DhwCyclingState()
-    correction, state, issue = dhw_cycling_correction(state, 4, T0)
-    assert correction == pytest.approx(-5.0) and not state.holding
-    # 60s later: coordinator recomputes ignitions-since-intervention, which is
-    # 0 (no new ignitions since T0) even though the raw window count is still 4.
-    # No new attempt fires, and the standing -5 K correction persists.
-    correction, state, issue = dhw_cycling_correction(state, 0, T0 + timedelta(seconds=60))
-    assert correction == pytest.approx(-5.0) and state.attempts == 1 and not issue
-    # Once genuinely new ignitions accumulate past the threshold, the first
-    # intervention has failed: second attempt hits the fail limit and holds.
-    correction, state, issue = dhw_cycling_correction(state, 3, T0 + timedelta(minutes=8))
-    assert state.holding and issue and correction == 0.0
-
-
-def test_dhw_cycling_persisting_episode_reaches_sticky_hold():
-    # Full arc: intervene at -5 K, quiet polls keep it applied, boiler keeps
-    # cycling anyway -> new post-intervention ignitions -> sticky hold + issue.
-    state = DhwCyclingState()
-    correction, state, _ = dhw_cycling_correction(state, 3, T0)
-    assert correction == pytest.approx(-5.0)
-    for m in (1, 2, 3):  # quiet polls while new ignitions accrue below threshold
-        correction, state, issue = dhw_cycling_correction(state, m - 1, T0 + timedelta(minutes=m))
-        assert correction == pytest.approx(-5.0) and not state.holding and not issue
-    correction, state, issue = dhw_cycling_correction(state, 3, T0 + timedelta(minutes=4))
-    assert state.holding and issue
-
-
-def test_dhw_target_shadow_computation_does_not_mutate_input_state():
-    # dhw_target/dhw_cycling_correction are pure: calling them for a "would
-    # write" preview must not affect the caller's own state object.
-    state = DhwCyclingState(attempts=1)
-    _value, new_state, _issue = dhw_target(40.0, None, False, 4, state, T0)
-    assert state.attempts == 1  # original untouched
-    assert new_state.attempts == 2
+def test_dhw_cylinder_target_preserves_completion_margin_without_exceeding_max():
+    value, _, _ = dhw_target(30, None, False, 0, DhwCyclingState(), T0, cylinder_target=60)
+    assert value == 65
+    value, _, _ = dhw_target(30, None, False, 0, DhwCyclingState(), T0, cylinder_target=75)
+    assert value == 70
 
 
 # --- hysteresis / min-hold (§3.2.6) ------------------------------------------
@@ -402,3 +341,16 @@ def test_clamp_helper():
     assert clamp(5, 0, 10) == 5
     assert clamp(-5, 0, 10) == 0
     assert clamp(15, 0, 10) == 10
+
+
+def test_inactive_demand_clears_sustain_timers_even_at_zero():
+    state = DemandCorrectionState(high_since=T0)
+    state = demand_correction_step(state, 100, T0 + timedelta(minutes=10), active=False)
+    assert state.high_since is None
+    state = demand_correction_step(state, 100, T0 + timedelta(minutes=21))
+    assert state.correction == 0
+
+
+def test_same_exempt_target_does_not_change_timestamp():
+    memory = WriteMemory(50, T0, T0)
+    assert not should_write(50, memory, T0 + timedelta(minutes=1), exempt=True)

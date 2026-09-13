@@ -1,9 +1,8 @@
 """Tests for core.policy: mode table, manual hold, write-or-not decision (spec §3.1, §3.2.6)."""
+
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
-from core.model import HysteresisParams, ManualHoldParams, ManualHoldState, Mode, WriteMemory
+from core.model import ManualHoldParams, ManualHoldState, Mode, WriteMemory
 from core.policy import (
     Action,
     ModeInputs,
@@ -22,27 +21,43 @@ T0 = datetime(2026, 1, 15, 7, 0, tzinfo=timezone.utc)
 
 
 def test_mode_off_when_disabled():
-    assert decide_mode(ModeInputs(enabled=False, heat_demand=True, dhw_demand=True, manual_hold_active=True)) is Mode.OFF
+    assert (
+        decide_mode(ModeInputs(enabled=False, heat_demand=True, dhw_demand=True, manual_hold_active=True)) is Mode.OFF
+    )
 
 
 def test_mode_manual_hold_beats_demand():
-    assert decide_mode(ModeInputs(enabled=True, heat_demand=True, dhw_demand=True, manual_hold_active=True)) is Mode.MANUAL_HOLD
+    assert (
+        decide_mode(ModeInputs(enabled=True, heat_demand=True, dhw_demand=True, manual_hold_active=True))
+        is Mode.MANUAL_HOLD
+    )
 
 
 def test_mode_idle_when_no_demand():
-    assert decide_mode(ModeInputs(enabled=True, heat_demand=False, dhw_demand=False, manual_hold_active=False)) is Mode.IDLE
+    assert (
+        decide_mode(ModeInputs(enabled=True, heat_demand=False, dhw_demand=False, manual_hold_active=False))
+        is Mode.IDLE
+    )
 
 
 def test_mode_heating_only():
-    assert decide_mode(ModeInputs(enabled=True, heat_demand=True, dhw_demand=False, manual_hold_active=False)) is Mode.HEATING
+    assert (
+        decide_mode(ModeInputs(enabled=True, heat_demand=True, dhw_demand=False, manual_hold_active=False))
+        is Mode.HEATING
+    )
 
 
 def test_mode_dhw_only():
-    assert decide_mode(ModeInputs(enabled=True, heat_demand=False, dhw_demand=True, manual_hold_active=False)) is Mode.DHW
+    assert (
+        decide_mode(ModeInputs(enabled=True, heat_demand=False, dhw_demand=True, manual_hold_active=False)) is Mode.DHW
+    )
 
 
 def test_mode_dhw_and_heating():
-    assert decide_mode(ModeInputs(enabled=True, heat_demand=True, dhw_demand=True, manual_hold_active=False)) is Mode.DHW_AND_HEATING
+    assert (
+        decide_mode(ModeInputs(enabled=True, heat_demand=True, dhw_demand=True, manual_hold_active=False))
+        is Mode.DHW_AND_HEATING
+    )
 
 
 # --- zone-max demand and DHW inference (change 1) ----------------------------

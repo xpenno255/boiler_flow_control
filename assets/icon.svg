@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Boiler Flow Control</title>
+  <desc>A boiler flame surrounded by warm and cool circulation arrows.</desc>
+  <path d="M42 104C53 63 85 31 125 26C163 22 200 45 218 79" fill="none" stroke="#FF7849" stroke-width="14" stroke-linecap="round"/>
+  <path d="M197 78L222 94L234 66" fill="none" stroke="#FF7849" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M214 151C203 192 171 224 131 229C93 233 56 210 38 176" fill="none" stroke="#1EBDD0" stroke-width="14" stroke-linecap="round"/>
+  <path d="M59 177L34 161L22 189" fill="none" stroke="#1EBDD0" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="72" y="48" width="112" height="158" rx="24" fill="#F3F8FC" stroke="#16364A" stroke-width="12"/>
+  <path d="M92 82H128" stroke="#16364A" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="156" cy="82" r="6" fill="#1EBDD0"/>
+  <path d="M129 105C132 127 155 130 155 153C155 169 143 180 128 180C112 180 101 169 101 155C101 141 113 133 118 122C120 132 125 137 128 136C134 129 134 119 129 105Z" fill="#F36A38"/>
+  <path d="M129 142C129 153 140 156 140 164C140 171 135 176 128 176C121 176 116 171 116 165C116 157 125 152 129 142Z" fill="#FFCA65"/>
+</svg>

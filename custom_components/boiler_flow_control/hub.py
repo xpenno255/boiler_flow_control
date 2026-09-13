@@ -5,6 +5,7 @@ heat demand, the heating-active toggle counter over a rolling 10-minute window,
 the return-temperature freshness check, and the last-write memory used for
 manual-hold detection (persisted via `BFCStore` so it survives restart).
 """
+
 from __future__ import annotations
 
 import logging
@@ -51,6 +52,10 @@ class BoilerFlowHub:
     dhw_cycling: DhwCyclingState = field(default_factory=DhwCyclingState)
 
     global_enabled: bool = True
+    burn_started_at: datetime | None = None
+    last_burn_seconds: float | None = None
+    last_stop_reason: str = "unknown"
+    last_burner_power: float | None = None
 
     # ------------------------------------------------------------------
     def load(self) -> None:
@@ -66,20 +71,17 @@ class BoilerFlowHub:
         self.last_target_change = dt_util.as_utc(parsed_change) if parsed_change else None
         df = self.store.get("demand_filtered")
         self.demand_filtered = float(df) if df is not None else None
-        attempts = self.store.get("dhw_cycling_attempts")
-        holding = self.store.get("dhw_cycling_holding")
-        intervention_at = self.store.get("dhw_cycling_last_intervention_at")
-        parsed_intervention = dt_util.parse_datetime(str(intervention_at)) if intervention_at else None
-        if attempts is not None or holding is not None or intervention_at is not None:
-            self.dhw_cycling = DhwCyclingState(
-                attempts=int(attempts or 0),
-                holding=bool(holding),
-                last_intervention_at=dt_util.as_utc(parsed_intervention) if parsed_intervention else None,
-            )
+        # v0.3 retires automatic cycling interventions. Old holds must never
+        # survive an upgrade and prevent a cylinder charge completing.
+        self.dhw_cycling = DhwCyclingState()
+        if self.store.get("control_version", 0) < 3:
+            self.last_written_setpoint = None
+            self.last_written_at = self.last_target_change = None
 
     def _persist(self) -> None:
         if self.store is None:
             return
+        self.store.set("control_version", 3)
         self.store.set("last_written_setpoint", self.last_written_setpoint)
         self.store.set("last_written_at", self.last_written_at.isoformat() if self.last_written_at else None)
         self.store.set("last_target_change", self.last_target_change.isoformat() if self.last_target_change else None)
@@ -113,8 +115,23 @@ class BoilerFlowHub:
         coordinator, not the 60 s poll — the boiler can short-cycle faster than
         once a minute, so a polled read undercounts). Returns the ignition
         count in the trailing `CYCLING_WINDOW_MINUTES` window (§3.2.4, §3.3.3)."""
+        self.burn_started_at = now
         self._toggle_times.append(now)
         return self.cycles_10min(now)
+
+    def record_stop(
+        self, now: datetime, relay_on: bool | None, current_flow: float | None, target: float | None
+    ) -> None:
+        self.last_burn_seconds = (now - self.burn_started_at).total_seconds() if self.burn_started_at else None
+        self.burn_started_at = None
+        if relay_on is False:
+            self.last_stop_reason = "relay_request_ended"
+        elif relay_on is True and current_flow is not None and target is not None and current_flow >= target - 1:
+            self.last_stop_reason = "possible_flow_limit"
+        elif relay_on is True:
+            self.last_stop_reason = "burner_stopped_during_heat_call"
+        else:
+            self.last_stop_reason = "unknown_relay_state"
 
     def cycles_10min(self, now: datetime) -> int:
         """Current ignition count in the trailing window, pruning stale entries
@@ -137,7 +154,9 @@ class BoilerFlowHub:
             return len(self._toggle_times)
         return len([t for t in self._toggle_times if t > since])
 
-    def sample_return(self, value: float | None, last_reported: datetime | None, now: datetime) -> tuple[float | None, bool]:
+    def sample_return(
+        self, value: float | None, last_reported: datetime | None, now: datetime
+    ) -> tuple[float | None, bool]:
         """Return (value_to_use, fresh). Fresh means the sensor's own
         `last_reported` (v0.2.1 review fix 5) is within RETURN_FRESHNESS_MINUTES
         of `now` — not merely that the state was numeric at poll time, which let
@@ -147,7 +166,9 @@ class BoilerFlowHub:
         if value is not None:
             self.last_return_value = value
             self.return_last_seen_at = last_reported or now
-        fresh = self.return_last_seen_at is not None and now - self.return_last_seen_at < timedelta(minutes=RETURN_FRESHNESS_MINUTES)
+        fresh = self.return_last_seen_at is not None and now - self.return_last_seen_at < timedelta(
+            minutes=RETURN_FRESHNESS_MINUTES
+        )
         return self.last_return_value, fresh
 
     def record_write(self, value: float, now: datetime, target_changed: bool = True) -> None:

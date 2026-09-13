@@ -1,4 +1,5 @@
 """Coordinator integration test: shadow mode computes, auto mode writes once (spec §4)."""
+
 from __future__ import annotations
 
 from uuid import uuid4
@@ -23,7 +24,11 @@ from custom_components.boiler_flow_control.const import (
     OVERRIDE_AUTO,
     OVERRIDE_SHADOW,
 )
-from custom_components.boiler_flow_control.core.model import DemandCorrectionState, DhwCyclingState, ReturnCorrectionState
+from custom_components.boiler_flow_control.core.model import (
+    DemandCorrectionState,
+    DhwCyclingState,
+    ReturnCorrectionState,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -53,7 +58,9 @@ async def _setup(hass: HomeAssistant) -> tuple[MockConfigEntry, list]:
     hass.states.async_set("sensor.hw_relay_demand", "0")
 
     entry = MockConfigEntry(
-        domain=DOMAIN, title="Boiler Flow Control", entry_id=_uid(),
+        domain=DOMAIN,
+        title="Boiler Flow Control",
+        entry_id=_uid(),
         data={
             CONF_FLOW_SETPOINT_ENTITY: "number.boiler_selflowtemp",
             CONF_OUTDOOR_TEMP_ENTITY: "sensor.outdoor_temp",
@@ -141,7 +148,9 @@ async def _setup_with_zones(hass: HomeAssistant) -> tuple[MockConfigEntry, list]
     hass.states.async_set("sensor.zone_2_demand", "unavailable")
 
     entry = MockConfigEntry(
-        domain=DOMAIN, title="Boiler Flow Control", entry_id=_uid(),
+        domain=DOMAIN,
+        title="Boiler Flow Control",
+        entry_id=_uid(),
         data={
             CONF_FLOW_SETPOINT_ENTITY: "number.boiler_selflowtemp",
             CONF_OUTDOOR_TEMP_ENTITY: "sensor.outdoor_temp",
@@ -157,14 +166,14 @@ async def _setup_with_zones(hass: HomeAssistant) -> tuple[MockConfigEntry, list]
     return entry, calls
 
 
-async def test_dhw_only_charge_inferred_from_zone_max_and_aggregate(hass: HomeAssistant):
+async def test_partial_zone_loss_does_not_infer_dhw(hass: HomeAssistant):
     entry, calls = await _setup_with_zones(hass)
     coordinator = entry.runtime_data
     d = coordinator.data
     assert d.zone_max_demand == 0.0  # unavailable zone ignored, both effectively 0
     assert d.aggregate_heat_demand == pytest.approx(100.0)
     assert d.heat_demand == 0.0  # heating-side signal is the zone max, not the aggregate
-    assert d.mode == "dhw"  # inferred despite the relay reading 0
+    assert d.mode == "idle"  # an unavailable zone could conceal heating demand
 
 
 async def test_genuine_heating_demand_not_mistaken_for_dhw(hass: HomeAssistant):
@@ -189,7 +198,9 @@ async def test_ignition_counter_counts_sub_minute_state_changes(hass: HomeAssist
     hass.states.async_set("binary_sensor.heating_active", "off")
 
     entry = MockConfigEntry(
-        domain=DOMAIN, title="Boiler Flow Control", entry_id=_uid(),
+        domain=DOMAIN,
+        title="Boiler Flow Control",
+        entry_id=_uid(),
         data={
             CONF_FLOW_SETPOINT_ENTITY: "number.boiler_selflowtemp",
             CONF_OUTDOOR_TEMP_ENTITY: "sensor.outdoor_temp",
@@ -233,7 +244,9 @@ async def test_ignition_counter_ignores_unavailable_and_initial_creation(hass: H
     hass.states.async_set("binary_sensor.heating_active", "unavailable")
 
     entry = MockConfigEntry(
-        domain=DOMAIN, title="Boiler Flow Control", entry_id=_uid(),
+        domain=DOMAIN,
+        title="Boiler Flow Control",
+        entry_id=_uid(),
         data={
             CONF_FLOW_SETPOINT_ENTITY: "number.boiler_selflowtemp",
             CONF_OUTDOOR_TEMP_ENTITY: "sensor.outdoor_temp",
@@ -282,7 +295,9 @@ async def test_failed_write_is_not_recorded(hass: HomeAssistant):
     hass.states.async_set("sensor.hw_relay_demand", "0")
 
     entry = MockConfigEntry(
-        domain=DOMAIN, title="Boiler Flow Control", entry_id=_uid(),
+        domain=DOMAIN,
+        title="Boiler Flow Control",
+        entry_id=_uid(),
         data={
             CONF_FLOW_SETPOINT_ENTITY: "number.boiler_selflowtemp",
             CONF_OUTDOOR_TEMP_ENTITY: "sensor.outdoor_temp",
@@ -313,7 +328,9 @@ async def test_idle_parks_at_bare_curve_not_corrected_heating_value(hass: HomeAs
     hass.states.async_set("sensor.hw_relay_demand", "0")
 
     entry = MockConfigEntry(
-        domain=DOMAIN, title="Boiler Flow Control", entry_id=_uid(),
+        domain=DOMAIN,
+        title="Boiler Flow Control",
+        entry_id=_uid(),
         data={
             CONF_FLOW_SETPOINT_ENTITY: "number.boiler_selflowtemp",
             CONF_OUTDOOR_TEMP_ENTITY: "sensor.outdoor_temp",
@@ -348,7 +365,9 @@ async def test_return_ceiling_accumulator_frozen_during_dhw(hass: HomeAssistant)
     hass.states.async_set("sensor.cylinder_temp", "40")
 
     entry = MockConfigEntry(
-        domain=DOMAIN, title="Boiler Flow Control", entry_id=_uid(),
+        domain=DOMAIN,
+        title="Boiler Flow Control",
+        entry_id=_uid(),
         data={
             CONF_FLOW_SETPOINT_ENTITY: "number.boiler_selflowtemp",
             CONF_OUTDOOR_TEMP_ENTITY: "sensor.outdoor_temp",
@@ -382,7 +401,9 @@ async def test_shadow_mode_does_not_persist_dhw_cycling_state(hass: HomeAssistan
     hass.states.async_set("binary_sensor.heating_active", "off")
 
     entry = MockConfigEntry(
-        domain=DOMAIN, title="Boiler Flow Control", entry_id=_uid(),
+        domain=DOMAIN,
+        title="Boiler Flow Control",
+        entry_id=_uid(),
         data={
             CONF_FLOW_SETPOINT_ENTITY: "number.boiler_selflowtemp",
             CONF_OUTDOOR_TEMP_ENTITY: "sensor.outdoor_temp",
@@ -420,7 +441,9 @@ async def test_options_removal_does_not_resurface_from_data(hass: HomeAssistant)
     hass.states.async_set("sensor.cylinder_temp", "40")
 
     entry = MockConfigEntry(
-        domain=DOMAIN, title="Boiler Flow Control", entry_id=_uid(),
+        domain=DOMAIN,
+        title="Boiler Flow Control",
+        entry_id=_uid(),
         data={
             CONF_FLOW_SETPOINT_ENTITY: "number.boiler_selflowtemp",
             CONF_OUTDOOR_TEMP_ENTITY: "sensor.outdoor_temp",

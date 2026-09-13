@@ -1,14 +1,13 @@
 """Shared entity base class."""
+
 from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from .const import DOMAIN, VERSION
 from .coordinator import BFCCoordinator, BFCCoordinatorData
-
-VERSION = "0.1.0"
 
 
 class BFCEntity(CoordinatorEntity[BFCCoordinator]):
@@ -28,7 +27,8 @@ class BFCEntity(CoordinatorEntity[BFCCoordinator]):
             identifiers={(DOMAIN, self._entry.entry_id)},
             name="Boiler Flow Control",
             manufacturer="Boiler Flow Control",
-            model=VERSION,
+            model="Flow temperature controller",
+            sw_version=VERSION,
         )
 
     @property

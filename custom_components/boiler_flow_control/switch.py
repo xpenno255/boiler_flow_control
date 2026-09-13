@@ -1,4 +1,5 @@
 """Enable switch for Boiler Flow Control (§4)."""
+
 from __future__ import annotations
 
 from homeassistant.components.switch import SwitchEntity
@@ -30,15 +31,17 @@ class BFCEnableSwitch(BFCEntity, SwitchEntity, RestoreEntity):
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         last = await self.async_get_last_state()
-        if last is not None and last.state in ("on", "off"):
+        if self.coordinator._store.get("enabled") is None and last is not None and last.state in ("on", "off"):
             self.coordinator.enabled = last.state == "on"
 
     async def async_turn_on(self, **kwargs) -> None:
         self.coordinator.enabled = True
         self.async_write_ha_state()
+        await self.coordinator.async_save_settings()
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs) -> None:
         self.coordinator.enabled = False
         self.async_write_ha_state()
+        await self.coordinator.async_save_settings()
         await self.coordinator.async_request_refresh()

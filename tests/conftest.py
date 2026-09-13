@@ -1,4 +1,5 @@
 """Make the pure `core` package importable without Home Assistant."""
+
 import sys
 from pathlib import Path
 

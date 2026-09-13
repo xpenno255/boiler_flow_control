@@ -18,7 +18,11 @@
               "heat_demand_entity": "Aggregate heat demand",
               "hw_relay_demand_entity": "Hot-water relay demand",
               "cylinder_temp_entity": "Cylinder temperature",
-              "max_flow_entity": "Maximum flow number (boiler max setpoint)"
+              "max_flow_entity": "Maximum flow number (boiler max setpoint)",
+              "zone_demand_entities": "Heating zone demand sensors",
+              "cylinder_target_entity": "Cylinder target (optional live setting)",
+              "room_climate_entities": "Room thermostats for comfort feedback",
+              "boiler_relay_entity": "Boiler appliance relay (cycling diagnosis)"
             }
           },
           "tunables_section": {
@@ -28,18 +32,28 @@
               "flow_max": "Flow ceiling",
               "dhw_flow_min": "DHW flow floor",
               "dhw_flow_max": "DHW flow ceiling",
-              "dhw_return_ceiling": "DHW return ceiling",
-              "min_hold_minutes": "Minimum time between heating writes",
-              "manual_hold_minutes": "Manual hold duration"
+              "min_hold_minutes": "Minimum time between target changes",
+              "manual_hold_minutes": "Manual hold duration",
+              "dhw_target": "Cylinder target when no live setting is available",
+              "dhw_fallback_flow": "DHW fallback flow temperature",
+              "dhw_progress_minutes": "DHW progress check interval",
+              "dhw_timeout_minutes": "DHW charge timeout",
+              "input_freshness_minutes": "Maximum age of demand and cylinder readings",
+              "outdoor_freshness_minutes": "Maximum age of outdoor temperature"
             }
           }
         }
       }
     },
-    "abort": {"already_configured": "Boiler Flow Control is already configured. Edit it from the integration's options."},
+    "abort": {
+      "already_configured": "Boiler Flow Control is already configured. Edit it from the integration's options."
+    },
     "error": {
       "flow_min_above_max": "Flow floor must not be above flow ceiling.",
-      "dhw_flow_min_above_max": "DHW flow floor must not be above DHW flow ceiling."
+      "dhw_flow_min_above_max": "DHW flow floor must not be above DHW flow ceiling.",
+      "fallback_outside_range": "DHW fallback must be between the DHW floor and ceiling.",
+      "insufficient_dhw_headroom": "DHW ceiling must be at least 5\u00b0C above the configured cylinder target.",
+      "timeout_before_progress": "Charge timeout must not be shorter than the progress check interval."
     }
   },
   "options": {
@@ -61,7 +75,11 @@
               "heat_demand_entity": "Aggregate heat demand",
               "hw_relay_demand_entity": "Hot-water relay demand",
               "cylinder_temp_entity": "Cylinder temperature",
-              "max_flow_entity": "Maximum flow number (boiler max setpoint)"
+              "max_flow_entity": "Maximum flow number (boiler max setpoint)",
+              "zone_demand_entities": "Heating zone demand sensors",
+              "cylinder_target_entity": "Cylinder target (optional live setting)",
+              "room_climate_entities": "Room thermostats for comfort feedback",
+              "boiler_relay_entity": "Boiler appliance relay (cycling diagnosis)"
             }
           },
           "tunables_section": {
@@ -71,9 +89,14 @@
               "flow_max": "Flow ceiling",
               "dhw_flow_min": "DHW flow floor",
               "dhw_flow_max": "DHW flow ceiling",
-              "dhw_return_ceiling": "DHW return ceiling",
-              "min_hold_minutes": "Minimum time between heating writes",
-              "manual_hold_minutes": "Manual hold duration"
+              "min_hold_minutes": "Minimum time between target changes",
+              "manual_hold_minutes": "Manual hold duration",
+              "dhw_target": "Cylinder target when no live setting is available",
+              "dhw_fallback_flow": "DHW fallback flow temperature",
+              "dhw_progress_minutes": "DHW progress check interval",
+              "dhw_timeout_minutes": "DHW charge timeout",
+              "input_freshness_minutes": "Maximum age of demand and cylinder readings",
+              "outdoor_freshness_minutes": "Maximum age of outdoor temperature"
             }
           }
         }
@@ -81,16 +104,25 @@
     },
     "error": {
       "flow_min_above_max": "Flow floor must not be above flow ceiling.",
-      "dhw_flow_min_above_max": "DHW flow floor must not be above DHW flow ceiling."
+      "dhw_flow_min_above_max": "DHW flow floor must not be above DHW flow ceiling.",
+      "fallback_outside_range": "DHW fallback must be between the DHW floor and ceiling.",
+      "insufficient_dhw_headroom": "DHW ceiling must be at least 5\u00b0C above the configured cylinder target.",
+      "timeout_before_progress": "Charge timeout must not be shorter than the progress check interval."
     }
   },
   "selector": {
-    "mode_override": {"options": {"auto": "Auto (write to the boiler)", "shadow": "Shadow (compute only, write nothing)", "hold": "Hold (compute, never write)"}}
+    "mode_override": {
+      "options": {
+        "auto": "Auto (write to the boiler)",
+        "shadow": "Shadow (compute only, write nothing)",
+        "hold": "Hold (compute, never write)"
+      }
+    }
   },
   "issues": {
-    "dhw_cycling_unfixable": {
-      "title": "DHW cycling guard could not stop the boiler cycling",
-      "description": "The coil, pump or minimum burner power need attention; flow-temperature correction alone cannot fix it. Flow is being held at the DHW floor."
+    "dhw_charge_problem": {
+      "title": "Check hot-water charging",
+      "description": "Boiler Flow Control detected: {reason}. It uses the configured DHW fallback when temperature readings or progress are inadequate. Check the cylinder target, primary flow limits, temperature sensor and circulation. Boiler limits are never raised automatically."
     }
   }
 }

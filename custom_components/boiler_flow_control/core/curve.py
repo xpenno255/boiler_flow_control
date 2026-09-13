@@ -5,8 +5,10 @@ hysteresis/min-hold. Nothing here knows about entities or Home Assistant; the
 hub supplies filtered demand, toggle counts and sensor freshness, and the
 coordinator calls these functions once per cycle.
 """
+
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 from .model import (
@@ -70,9 +72,10 @@ def demand_correction_step(
     heating would start 8 K low next time).
     """
     if demand_filtered is None:
-        return state  # no data: hold the last correction
+        return replace(state, high_since=None, low_since=None)
 
     if not active:
+        state = replace(state, high_since=None, low_since=None)
         if state.correction == 0.0:
             return state
         if state.last_step_at is not None and now - state.last_step_at < timedelta(minutes=params.step_period_minutes):
@@ -128,15 +131,27 @@ def return_ceiling_step(
     return_temp: float | None,
     fresh: bool,
     params: ReturnCeilingParams = ReturnCeilingParams(),
+    *,
+    now: datetime,
+    active: bool = True,
+    comfort_limited: bool = False,
 ) -> ReturnCorrectionState:
-    """Return-ceiling correction. Acts every cycle (no min_hold gate); only
-    when the return sensor is available and fresh (< freshness_minutes)."""
+    """Slow efficiency trim; stale data removes its authority immediately.
+
+    Elapsed time is capped at two minutes so an HA outage cannot create a
+    large accumulated step. The first sample establishes the time origin.
+    Only settled heating may accumulate a negative correction.
+    """
     if return_temp is None or not fresh:
-        return state  # stale/missing: freeze the last correction
-    if return_temp > params.return_ceiling:
-        return ReturnCorrectionState(max(params.floor_k, state.correction - params.step_k))
-    # below ceiling: recover towards 0 at the same rate
-    return ReturnCorrectionState(min(0.0, state.correction + params.step_k))
+        return ReturnCorrectionState(sampled_at=now)
+    minutes = 0.0 if state.sampled_at is None else max(0.0, min(2.0, (now - state.sampled_at).total_seconds() / 60))
+    step = params.step_k * minutes
+    correction = max(params.floor_k, min(0.0, state.correction))
+    if not active or comfort_limited or return_temp < params.return_ceiling - params.deadband_k:
+        correction = min(0.0, correction + step)
+    elif return_temp > params.return_ceiling + params.deadband_k:
+        correction = max(params.floor_k, correction - step)
+    return ReturnCorrectionState(correction, now)
 
 
 # ---------------------------------------------------------------------------
@@ -149,11 +164,9 @@ def cycling_guard_correction(
     demand_filtered: float | None,
     params: CyclingGuardParams = CyclingGuardParams(),
 ) -> float:
-    if toggle_count < params.toggle_threshold:
-        return 0.0
-    if demand_filtered is not None and demand_filtered >= params.demand_threshold:
-        return 0.0  # high demand + cycling: not a flow-temperature problem
-    return -params.step_k
+    # A start count does not establish the cause or the correct direction.
+    # Keep this pure API for callers, but all cycling control is diagnostic.
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -180,9 +193,8 @@ def heating_target(
 
 
 def dhw_return_correction(return_temp: float | None, fresh: bool, params: DhwParams = DhwParams()) -> float:
-    if return_temp is None or not fresh:
-        return 0.0
-    return -params.return_step_k if return_temp > params.dhw_return_ceiling else 0.0
+    """DHW completion takes priority; high return alone is not a coil fault."""
+    return 0.0
 
 
 def dhw_cycling_correction(
@@ -191,58 +203,38 @@ def dhw_cycling_correction(
     now: datetime,
     params: DhwParams = DhwParams(),
 ) -> tuple[float, DhwCyclingState, bool]:
-    """Returns (correction, new_state, issue_raised).
-
-    `toggle_count` is the ignition count in the trailing window that occurred
-    *after* `state.last_intervention_at` (v0.2.1 review fix 3a), not the raw
-    window total: otherwise the same batch of ignitions sitting in the
-    10-minute window would keep re-triggering an attempt on every 60 s poll,
-    reaching the sticky hold in 2 minutes instead of across genuinely separate
-    episodes. First cycling episode: -cycling_step_k and log. If cycling
-    persists into a second episode, hold at dhw_flow_min and raise a repair
-    issue (§3.3.3); the hold is sticky until cleared outside this function
-    (the coil/pump/min-power need attention, software cannot fix it).
-    """
-    if state.holding:
-        return 0.0, state, False  # already holding; caller clamps to dhw_flow_min
-    cycling = toggle_count >= params.toggle_threshold
-    if not cycling:
-        # Quiet poll: an episode is still in flight — keep the correction and
-        # the attempt count. Dropping them here would pop the flow back up
-        # after 60 s and make the fail limit unreachable while the boiler is
-        # still accumulating post-intervention ignitions. Attempts reset at
-        # charge end (coordinator), not on a quiet poll.
-        return state.correction_k, state, False
-    attempts = state.attempts + 1
-    if attempts >= params.cycling_fail_limit:
-        return 0.0, DhwCyclingState(attempts=attempts, holding=True, last_intervention_at=now, correction_k=state.correction_k), True
-    correction = state.correction_k - params.cycling_step_k
-    return correction, DhwCyclingState(attempts=attempts, holding=False, last_intervention_at=now, correction_k=correction), False
+    """Retired interventions: clear legacy holds without creating new ones."""
+    return 0.0, DhwCyclingState(), False
 
 
 def dhw_target(
-    cylinder_temp: float,
+    cylinder_temp: float | None,
     return_temp: float | None,
     return_fresh: bool,
     toggle_count: int,
     cycling_state: DhwCyclingState,
     now: datetime,
     params: DhwParams = DhwParams(),
+    *,
+    cylinder_target: float | None = None,
+    fallback: float | None = None,
+    completion_margin: float = 5.0,
 ) -> tuple[float, DhwCyclingState, bool]:
-    """Returns (target flow, new cycling state, issue_raised).
+    """Follow cylinder temperature while preserving configured completion headroom.
 
-    v0.2.1 review fix 4: the base (cylinder + delta) is clamped to
-    [dhw_flow_min, dhw_flow_max] *before* corrections are applied, then only
-    floored at dhw_flow_min afterwards — otherwise a -3/-5 K correction at the
-    70 °C ceiling was clamped straight back up to 70 and silently disappeared.
+    Missing cylinder data uses the commissioned fallback (by default the
+    existing DHW maximum), never the outdoor heating curve. All targets remain
+    within the configured primary-water limits. The coordinator reports when
+    a limit prevents the required headroom; it must never raise that limit.
     """
-    cycling_correction, new_state, issue_raised = dhw_cycling_correction(cycling_state, toggle_count, now, params)
-    if new_state.holding:
-        return params.dhw_flow_min, new_state, issue_raised
-    base = clamp(cylinder_temp + params.dhw_delta, params.dhw_flow_min, params.dhw_flow_max)
-    return_correction = dhw_return_correction(return_temp, return_fresh, params)
-    total = base + return_correction + cycling_correction
-    return max(params.dhw_flow_min, total), new_state, issue_raised
+    base = (
+        (fallback if fallback is not None else params.dhw_flow_max)
+        if cylinder_temp is None
+        else cylinder_temp + params.dhw_delta
+    )
+    if cylinder_target is not None:
+        base = max(base, cylinder_target + completion_margin)
+    return clamp(base, params.dhw_flow_min, params.dhw_flow_max), DhwCyclingState(), False
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +258,8 @@ def should_write(
     >= hysteresis_k would be blocked forever. Falls back to `last_written_at`
     when `last_target_change` is None (e.g. state persisted before this fix).
     """
+    if memory.last_written_setpoint is not None and abs(new_value - memory.last_written_setpoint) < 1e-6:
+        return False
     if exempt:
         return True
     if memory.last_written_setpoint is None:

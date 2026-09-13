@@ -4,11 +4,13 @@ All decisions live in `core.curve` and `core.policy`. This module reads
 entities, converts units, calls the pure functions, performs at most one
 `number.set_value` service call, and publishes a snapshot for the entities.
 """
+
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from math import isfinite
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -19,38 +21,52 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_BOILER_RELAY_ENTITY,
     CONF_BURNER_POWER_ENTITY,
     CONF_CURRENT_FLOW_ENTITY,
+    CONF_CYLINDER_TARGET_ENTITY,
     CONF_CYLINDER_TEMP_ENTITY,
     CONF_DESIGN_FLOW,
     CONF_DESIGN_OUTDOOR,
     CONF_DHW_DELTA,
+    CONF_DHW_FALLBACK_FLOW,
     CONF_DHW_FLOW_MAX,
     CONF_DHW_FLOW_MIN,
+    CONF_DHW_PROGRESS_MINUTES,
     CONF_DHW_RETURN_CEILING,
+    CONF_DHW_TARGET,
+    CONF_DHW_TIMEOUT_MINUTES,
     CONF_FLOW_MAX,
     CONF_FLOW_MIN,
     CONF_FLOW_SETPOINT_ENTITY,
     CONF_HEAT_DEMAND_ENTITY,
     CONF_HEATING_ACTIVE_ENTITY,
     CONF_HW_RELAY_DEMAND_ENTITY,
+    CONF_INPUT_FRESHNESS_MINUTES,
     CONF_MANUAL_HOLD_MINUTES,
     CONF_MAX_FLOW_ENTITY,
     CONF_MIN_HOLD_MINUTES,
+    CONF_OUTDOOR_FRESHNESS_MINUTES,
     CONF_OUTDOOR_TEMP_ENTITY,
     CONF_RETURN_CEILING,
     CONF_RETURN_TEMP_ENTITY,
+    CONF_ROOM_CLIMATE_ENTITIES,
     CONF_ZONE_DEMAND_ENTITIES,
     DEFAULT_DESIGN_FLOW,
     DEFAULT_DESIGN_OUTDOOR,
     DEFAULT_DHW_DELTA,
     DEFAULT_DHW_FLOW_MAX,
     DEFAULT_DHW_FLOW_MIN,
+    DEFAULT_DHW_PROGRESS_MINUTES,
     DEFAULT_DHW_RETURN_CEILING,
+    DEFAULT_DHW_TARGET,
+    DEFAULT_DHW_TIMEOUT_MINUTES,
     DEFAULT_FLOW_MAX,
     DEFAULT_FLOW_MIN,
+    DEFAULT_INPUT_FRESHNESS_MINUTES,
     DEFAULT_MANUAL_HOLD_MINUTES,
     DEFAULT_MIN_HOLD_MINUTES,
+    DEFAULT_OUTDOOR_FRESHNESS_MINUTES,
     DEFAULT_OVERRIDE,
     DEFAULT_RETURN_CEILING,
     DOMAIN,
@@ -58,20 +74,15 @@ from .const import (
     ROOM_DESIGN_TEMP,
     UPDATE_INTERVAL_SECONDS,
 )
+from .core.control import ChargeMonitor, ControlState, DhwDemandTracker, effective_target
 from .core.curve import (
-    cycling_guard_correction,
     demand_correction_step,
     dhw_target,
     heating_curve,
-    heating_target,
     return_ceiling_step,
-    should_write,
 )
 from .core.model import (
     CurveParams,
-    CyclingGuardParams,
-    DemandCorrectionParams,
-    DemandCorrectionState,
     DhwCyclingState,
     DhwParams,
     HysteresisParams,
@@ -79,7 +90,6 @@ from .core.model import (
     ManualHoldState,
     Mode,
     ReturnCeilingParams,
-    ReturnCorrectionState,
 )
 from .core.policy import (
     Action,
@@ -137,6 +147,21 @@ class BFCCoordinatorData:
     cylinder_temp: float | None = None
     max_flow: float | None = None
     live_setpoint: float | None = None
+    requested_target: float | None = None
+    confirmed_setpoint: float | None = None
+    write_status: str = "not_attempted"
+    dhw_active: bool = False
+    dhw_source: str = "none"
+    cylinder_target: float | None = None
+    dhw_charge_minutes: float = 0.0
+    dhw_charge_starts: int = 0
+    dhw_status: str = "idle"
+    burner_power: float | None = None
+    last_burn_seconds: float | None = None
+    last_stop_reason: str = "unknown"
+    cycling_status: str = "normal"
+    room_correction: float = 0.0
+    room_error: float | None = None
     # Diagnostics
     disabled_features: list[str] = field(default_factory=list)
 
@@ -153,19 +178,32 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
         # merging `{**entry.data, **entry.options}` let a key removed in options
         # resurface from the original `entry.data`.
         self._config: dict[str, Any] = dict(entry.options) if entry.options else dict(entry.data)
-        self._enabled = True
-        self._override = str(self._config.get("mode_override", DEFAULT_OVERRIDE))
+        self._enabled = bool(store.get("enabled", True))
+        self._override = str(store.get("mode_override", self._config.get("mode_override", DEFAULT_OVERRIDE)))
         self._tunables: dict[str, float] = {
             CONF_DESIGN_FLOW: float(store.get(CONF_DESIGN_FLOW, DEFAULT_DESIGN_FLOW)),
             CONF_DESIGN_OUTDOOR: float(store.get(CONF_DESIGN_OUTDOOR, DEFAULT_DESIGN_OUTDOOR)),
             CONF_RETURN_CEILING: float(store.get(CONF_RETURN_CEILING, DEFAULT_RETURN_CEILING)),
             CONF_DHW_DELTA: float(store.get(CONF_DHW_DELTA, DEFAULT_DHW_DELTA)),
         }
-        self._demand_state = DemandCorrectionState()
-        self._return_state = ReturnCorrectionState()
+        self._auto_control = ControlState()
+        self._shadow_control = ControlState()
+        self._dhw_tracker = DhwDemandTracker()
+        self._charge = ChargeMonitor()
+        self._pending_since: datetime | None = None
+        self._confirmed_target: float | None = None
+        self._last_max_flow: float | None = None
+        self._return_filtered: float | None = None
+        self._return_filter_at: datetime | None = None
         self._manual_hold_state = ManualHoldState()
         self._prev_mode: Mode = Mode.OFF
-        super().__init__(hass, _LOGGER, config_entry=entry, name="Boiler Flow Control", update_interval=timedelta(seconds=UPDATE_INTERVAL_SECONDS))
+        super().__init__(
+            hass,
+            _LOGGER,
+            config_entry=entry,
+            name="Boiler Flow Control",
+            update_interval=timedelta(seconds=UPDATE_INTERVAL_SECONDS),
+        )
 
     # ------------------------------------------------------------------
     # Properties used by entities
@@ -177,7 +215,10 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
 
     @enabled.setter
     def enabled(self, value: bool) -> None:
+        if value != self._enabled:
+            self._auto_control = ControlState()
         self._enabled = value
+        self._store.set("enabled", value)
 
     @property
     def override(self) -> str:
@@ -185,7 +226,14 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
 
     @override.setter
     def override(self, value: str) -> None:
+        if value != self._override:
+            self._auto_control = ControlState()
+            self._shadow_control = ControlState()
         self._override = value
+        self._store.set("mode_override", value)
+
+    async def async_save_settings(self) -> None:
+        await self._store.async_save()
 
     def get_tunable(self, key: str) -> float:
         return self._tunables[key]
@@ -204,26 +252,96 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
     def _state(self, entity_id: str | None):
         return self.hass.states.get(entity_id) if entity_id else None
 
-    def _float_state(self, entity_id: str | None) -> float | None:
+    @property
+    def _control(self) -> ControlState:
+        return self._auto_control if self._enabled and self._override == OVERRIDE_AUTO else self._shadow_control
+
+    @property
+    def _demand_state(self):
+        return self._control.demand
+
+    @_demand_state.setter
+    def _demand_state(self, value):
+        self._control.demand = value
+
+    @property
+    def _return_state(self):
+        return self._control.return_trim
+
+    @_return_state.setter
+    def _return_state(self, value):
+        self._control.return_trim = value
+
+    def _fresh(self, state, minutes: float, now: datetime) -> bool:
+        reported = (state.last_reported or state.last_updated) if state is not None else None
+        return reported is not None and timedelta(0) <= now - reported <= timedelta(minutes=minutes)
+
+    @staticmethod
+    def _to_celsius(value: float, unit: str | None) -> float | None:
+        if unit in (None, "°C", "C"):
+            return value
+        if unit in ("°F", "F"):
+            return (value - 32) * 5 / 9
+        if unit == "K":
+            return value - 273.15
+        return None
+
+    def _float_state(
+        self,
+        entity_id: str | None,
+        *,
+        temperature: bool = False,
+        freshness: float | None = None,
+        now: datetime | None = None,
+        attribute: str | None = None,
+    ) -> float | None:
         st = self._state(entity_id)
         if st is None or st.state in UNAVAILABLE:
+            return None
+        if freshness is not None and not self._fresh(st, freshness, now or dt_util.utcnow()):
             return None
         try:
-            return float(st.state)
+            value = float(st.attributes.get(attribute) if attribute else st.state)
         except (ValueError, TypeError):
             return None
+        if not isfinite(value):
+            return None
+        if temperature:
+            unit = st.attributes.get("unit_of_measurement", st.attributes.get("temperature_unit"))
+            if unit is None and entity_id.split(".")[0] in ("climate", "water_heater"):
+                unit = self.hass.config.units.temperature_unit
+            value = self._to_celsius(value, unit)
+            if value is None or not -60 <= value <= 120:
+                return None
+        return value
 
-    def _is_on(self, entity_id: str | None) -> bool | None:
-        """True for binary 'on', or for a numeric sensor above zero (e.g. a relay demand %)."""
+    def _is_on(self, entity_id: str | None, *, freshness: float | None = None) -> bool | None:
         st = self._state(entity_id)
-        if st is None or st.state in UNAVAILABLE:
+        if (
+            st is None
+            or st.state in UNAVAILABLE
+            or (freshness is not None and not self._fresh(st, freshness, dt_util.utcnow()))
+        ):
             return None
         if st.state in ("on", "off"):
             return st.state == "on"
-        try:
-            return float(st.state) > 0.0
-        except (TypeError, ValueError):
+        value = self._float_state(entity_id)
+        return value > 0 if value is not None and 0 <= value <= 100 else None
+
+    def _setpoint_constraints(self, max_flow: float | None) -> tuple[float, float, float] | None:
+        st = self._state(self._config.get(CONF_FLOW_SETPOINT_ENTITY))
+        if st is None:
             return None
+        unit = st.attributes.get("unit_of_measurement")
+        try:
+            lo = self._to_celsius(float(st.attributes.get("min", 5)), unit)
+            hi = self._to_celsius(float(st.attributes.get("max", 90)), unit)
+            step = float(st.attributes.get("step", 1)) * (5 / 9 if unit in ("°F", "F") else 1)
+        except (ValueError, TypeError):
+            return None
+        if lo is None or hi is None or not all(isfinite(v) for v in (lo, hi, step)):
+            return None
+        return lo, min(hi, max_flow) if max_flow is not None else hi, step
 
     # ------------------------------------------------------------------
     # Params
@@ -259,7 +377,7 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
     # Action
     # ------------------------------------------------------------------
 
-    async def _perform(self, decision: Decision, max_flow: float | None) -> bool:
+    async def _perform(self, decision: Decision) -> bool:
         """Perform the write. Returns True only on a confirmed successful call.
 
         v0.2.1 review fix 2: the call is now `blocking=True` and its result is
@@ -274,14 +392,18 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
         entity_id = self._config.get(CONF_FLOW_SETPOINT_ENTITY)
         if not entity_id:
             return False
-        value = decision.setpoint
-        if max_flow is not None:
-            value = min(value, max_flow)  # never exceed number.boiler_heatingtemp
+        value = decision.setpoint  # already constrained; memory uses this same value
+        st = self._state(entity_id)
+        unit = st.attributes.get("unit_of_measurement") if st else None
+        if unit in ("°F", "F"):
+            value = value * 9 / 5 + 32
+        elif unit == "K":
+            value += 273.15
         try:
             await self.hass.services.async_call(
                 "number", "set_value", {"entity_id": entity_id, "value": value}, blocking=True
             )
-            _LOGGER.info("BFC: wrote %.1f to %s (%s)", value, entity_id, decision.reason)
+            _LOGGER.debug("BFC: wrote %.1f to %s (%s)", value, entity_id, decision.reason)
             return True
         except Exception:  # noqa: BLE001
             _LOGGER.warning("BFC: number.set_value failed for %s", entity_id)
@@ -315,33 +437,39 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
         on every HA/ems-esp restart."""
         new_state = event.data.get("new_state")
         old_state = event.data.get("old_state")
-        if new_state is None or new_state.state != "on":
-            return
-        if old_state is None or old_state.state != "off":
-            return  # only count exact off->on transitions
         now = dt_util.utcnow()
-        count = self._hub.record_ignition(now)
-        # Update the published snapshot in place. We deliberately do not push a
-        # coordinator-wide update from here (no `async_set_updated_data`): the
-        # next 60 s poll republishes everything through the normal path, and
-        # this keeps the event listener a lightweight, synchronous counter.
-        if self.data is not None:
-            self.data.cycles_10min = count
+        if new_state is None or new_state.state not in ("on", "off"):
+            self._hub.burn_started_at = None
+            return
+        if old_state is None or old_state.state not in ("on", "off"):
+            return
+        if old_state.state == "off" and new_state.state == "on":
+            count = self._hub.record_ignition(now)
+            if self._charge.started_at is not None and self._dhw_tracker.active:
+                self._charge.starts += 1
+            if self.data is not None:
+                self.data.cycles_10min = count
+        elif old_state.state == "on" and new_state.state == "off":
+            self._hub.record_stop(
+                now,
+                self._is_on(self._config.get(CONF_BOILER_RELAY_ENTITY), freshness=5),
+                self._float_state(self._config.get(CONF_CURRENT_FLOW_ENTITY), temperature=True, freshness=5),
+                self._float_state(self._config.get(CONF_FLOW_SETPOINT_ENTITY), temperature=True),
+            )
 
-    def _maybe_raise_dhw_issue(self) -> None:
-        ir.async_create_issue(
-            self.hass,
-            DOMAIN,
-            "dhw_cycling_unfixable",
-            is_fixable=False,
-            severity=ir.IssueSeverity.WARNING,
-            translation_key="dhw_cycling_unfixable",
-        )
+    def async_subscribe_dhw(self):
+        entity = self._config.get(CONF_HW_RELAY_DEMAND_ENTITY)
+        return async_track_state_change_event(self.hass, entity, self._handle_dhw_event) if entity else None
+
+    @callback
+    def _handle_dhw_event(self, event) -> None:
+        self._entry.async_create_background_task(self.hass, self.async_request_refresh(), "BFC DHW refresh")
 
     async def async_reset_dhw_cycling(self) -> None:
-        """v0.2.1 review fix 3c: clear the sticky DHW cycling hold + attempts
-        and delete the repair issue, for the "Reset DHW cycling hold" button."""
+        """Clear charge diagnostics while retaining the existing button ID."""
         self._hub.set_dhw_cycling(DhwCyclingState())
+        self._charge = ChargeMonitor()
+        ir.async_delete_issue(self.hass, DOMAIN, "dhw_charge_problem")
         await self._hub.async_save()
         ir.async_delete_issue(self.hass, DOMAIN, "dhw_cycling_unfixable")
         await self.async_request_refresh()
@@ -355,201 +483,331 @@ class BFCCoordinator(DataUpdateCoordinator[BFCCoordinatorData]):
             return await self._cycle()
         except Exception as exc:  # noqa: BLE001
             _LOGGER.exception("BFC: update failed")
-            if self.data is not None:
-                return self.data
             raise UpdateFailed(str(exc)) from exc
 
     async def _cycle(self) -> BFCCoordinatorData:
         now = dt_util.utcnow()
         cfg = self._config
+        control = self._control
         d = BFCCoordinatorData(enabled=self._enabled, override=self._override, last_run=now)
-        disabled: list[str] = []
+        disabled = d.disabled_features
+        freshness = self._opt(CONF_INPUT_FRESHNESS_MINUTES, DEFAULT_INPUT_FRESHNESS_MINUTES)
+        outdoor_freshness = self._opt(CONF_OUTDOOR_FRESHNESS_MINUTES, DEFAULT_OUTDOOR_FRESHNESS_MINUTES)
 
-        # --- required inputs -------------------------------------------------
-        flow_setpoint_entity = cfg.get(CONF_FLOW_SETPOINT_ENTITY)
-        live_setpoint_state = self._state(flow_setpoint_entity)
-        if flow_setpoint_entity is None or live_setpoint_state is None or live_setpoint_state.state in UNAVAILABLE:
-            d.mode = "no_boiler"
-            d.no_boiler = True
-            d.reason = "ems-esp flow setpoint entity unavailable"
-            d.disabled_features = disabled
-            return d
-        d.live_setpoint = self._float_state(flow_setpoint_entity)
+        def temp(key, age=freshness):
+            return self._float_state(cfg.get(key), temperature=True, freshness=age, now=now)
 
-        d.outdoor_temp = self._float_state(cfg.get(CONF_OUTDOOR_TEMP_ENTITY))
-        if cfg.get(CONF_OUTDOOR_TEMP_ENTITY) is None or d.outdoor_temp is None:
-            disabled.append("heating curve disabled (no outdoor temperature)")
+        def demand(entity, age=freshness):
+            value = self._float_state(entity, freshness=age, now=now)
+            return value if value is not None and 0 <= value <= 100 else None
 
-        # --- optional inputs ---------------------------------------------------
-        d.current_flow = self._float_state(cfg.get(CONF_CURRENT_FLOW_ENTITY))
-        return_entity_state = self._state(cfg.get(CONF_RETURN_TEMP_ENTITY))
-        return_raw = self._float_state(cfg.get(CONF_RETURN_TEMP_ENTITY))
-        if cfg.get(CONF_RETURN_TEMP_ENTITY) is None:
-            disabled.append("return ceiling disabled (no return temperature sensor)")
-        # v0.2.1 review fix 5: freshness is the sensor's own last_reported (fallback
-        # last_updated), not poll time — a wedged-but-numeric sensor previously
-        # stayed "fresh" forever because we stamped return_last_seen_at every poll.
-        return_last_reported = (
-            (return_entity_state.last_reported or return_entity_state.last_updated) if return_entity_state is not None else None
-        )
-        d.return_temperature_used, d.return_fresh = self._hub.sample_return(return_raw, return_last_reported, now)
-
+        d.live_setpoint = temp(CONF_FLOW_SETPOINT_ENTITY, None)
+        d.outdoor_temp = temp(CONF_OUTDOOR_TEMP_ENTITY, outdoor_freshness)
+        d.current_flow = temp(CONF_CURRENT_FLOW_ENTITY, 5)
+        d.cylinder_temp = temp(CONF_CYLINDER_TEMP_ENTITY)
+        d.max_flow = temp(CONF_MAX_FLOW_ENTITY, None)  # a static setting, not a periodic measurement
+        d.burner_power = demand(cfg.get(CONF_BURNER_POWER_ENTITY), 5)
+        if d.burner_power is not None and d.burner_power > 0:
+            self._hub.last_burner_power = d.burner_power
+        if d.outdoor_temp is None:
+            disabled.append("heating curve disabled (outdoor temperature unavailable or stale)")
         if cfg.get(CONF_HEATING_ACTIVE_ENTITY) is None:
             disabled.append("cycling guard disabled (no heating-active sensor)")
-        # Change 3: the ignition counter is event-driven (see async_subscribe_heating_active);
-        # the 60 s poll only reads the current window, it no longer feeds it.
-        d.cycles_10min = self._hub.cycles_10min(now)
-
-        self._float_state(cfg.get(CONF_BURNER_POWER_ENTITY))  # read for future use / diagnostics only
-        if cfg.get(CONF_BURNER_POWER_ENTITY) is None:
+        if d.burner_power is None:
             disabled.append("burner power unavailable")
 
-        # --- heating-demand signal (change 1) -----------------------------------
-        # The aggregate controller sensor (01_144444_heat_demand) includes stored-
-        # hot-water demand: it reads 100 during a DHW-only charge while every
-        # per-zone sensor reads 0. Prefer the max of the configured zone sensors
-        # (ignoring unavailable ones) so a DHW-only charge does not pollute the
-        # heating-side low-pass filter / mode detection; fall back to the
-        # aggregate sensor only when no zone list is configured.
-        zone_entities: list[str] = cfg.get(CONF_ZONE_DEMAND_ENTITIES) or []
-        aggregate_raw = self._float_state(cfg.get(CONF_HEAT_DEMAND_ENTITY))
-        d.aggregate_heat_demand = aggregate_raw
-        d.zone_max_demand = zone_max_demand([self._float_state(e) for e in zone_entities])
-        if not zone_entities and cfg.get(CONF_HEAT_DEMAND_ENTITY) is None:
-            disabled.append("heating mode disabled (no aggregate heat-demand sensor)")
-        heat_demand_raw = d.zone_max_demand if zone_entities else aggregate_raw
-        d.heat_demand = heat_demand_raw
-        d.demand_filtered = self._hub.sample_demand(heat_demand_raw, now)
-
-        d.hw_relay_demand = self._float_state(cfg.get(CONF_HW_RELAY_DEMAND_ENTITY))
-        if cfg.get(CONF_HW_RELAY_DEMAND_ENTITY) is None:
-            disabled.append("DHW mode disabled (no HW relay demand sensor)")
-
-        d.cylinder_temp = self._float_state(cfg.get(CONF_CYLINDER_TEMP_ENTITY))
-        if cfg.get(CONF_CYLINDER_TEMP_ENTITY) is None:
-            disabled.append("DHW target disabled (no cylinder temperature sensor)")
-
-        d.max_flow = self._float_state(cfg.get(CONF_MAX_FLOW_ENTITY))
-
-        # --- mode inputs ---------------------------------------------------
-        heat_demand_bool = bool(d.heat_demand and d.heat_demand > 0)
-        relay_dhw_bool = bool(d.hw_relay_demand and d.hw_relay_demand > 0)
-        # DHW detection (change 1): relay OR inferred from the aggregate-includes-
-        # DHW signature. dhw_and_heating still requires the relay signal — see
-        # infer_dhw_demand's docstring and docs/spec.md v0.2 field findings.
-        dhw_demand_bool = infer_dhw_demand(
-            relay_demand_on=relay_dhw_bool,
-            zone_configured=bool(zone_entities),
-            aggregate_demand=aggregate_raw,
-            zone_max=d.zone_max_demand,
+        ret_state = self._state(cfg.get(CONF_RETURN_TEMP_ENTITY))
+        ret = temp(CONF_RETURN_TEMP_ENTITY, 10)
+        d.return_temperature_used, d.return_fresh = self._hub.sample_return(
+            ret, (ret_state.last_reported or ret_state.last_updated) if ret_state else None, now
         )
+        if not d.return_fresh or ret is None:
+            d.return_fresh = False
+            self._return_filtered, self._return_filter_at = None, None
+            disabled.append("return ceiling disabled (return temperature unavailable or stale)")
+        else:
+            elapsed = (now - self._return_filter_at).total_seconds() if self._return_filter_at else 0
+            self._return_filtered = (
+                ret
+                if self._return_filtered is None
+                else self._return_filtered + max(0, elapsed) / (180 + max(0, elapsed)) * (ret - self._return_filtered)
+            )
+            self._return_filter_at = now
 
-        manual_hold_active, self._manual_hold_state = detect_manual_hold(
-            d.live_setpoint, self._hub.last_written_setpoint, d.max_flow, now, self._manual_hold_state, self._manual_hold_params()
+        zones = cfg.get(CONF_ZONE_DEMAND_ENTITIES) or []
+        zone_values = [demand(e) for e in zones]
+        all_zones_valid = bool(zones) and all(v is not None for v in zone_values)
+        d.aggregate_heat_demand = demand(cfg.get(CONF_HEAT_DEMAND_ENTITY))
+        d.zone_max_demand = zone_max_demand(zone_values)
+        d.heat_demand = d.zone_max_demand if zones else d.aggregate_heat_demand
+        demand_valid = all_zones_valid if zones else d.heat_demand is not None
+        if not demand_valid:
+            disabled.append("demand adaptation disabled (incomplete or stale demand inputs)")
+        d.demand_filtered = self._hub.sample_demand(d.heat_demand if demand_valid else None, now)
+        d.hw_relay_demand = demand(cfg.get(CONF_HW_RELAY_DEMAND_ENTITY))
+        relay = d.hw_relay_demand > 0 if d.hw_relay_demand is not None else None
+        inferred = infer_dhw_demand(
+            False, bool(zones), d.aggregate_heat_demand, d.zone_max_demand, all_zones_valid=all_zones_valid
         )
-        d.manual_hold_active = manual_hold_active
+        definite_off = relay is False and (d.aggregate_heat_demand is not None and d.aggregate_heat_demand < 90)
+        d.dhw_active = self._dhw_tracker.update(relay, inferred, definite_off, now)
+        d.dhw_source = self._dhw_tracker.source
+        if relay is None and not all_zones_valid:
+            disabled.append("DHW detection degraded (relay or complete fresh zones required)")
 
-        mode = decide_mode(ModeInputs(
-            enabled=self._enabled, heat_demand=heat_demand_bool, dhw_demand=dhw_demand_bool,
-            manual_hold_active=manual_hold_active,
-        ))
+        # The cylinder's requested temperature is a static setting. A live
+        # climate/water_heater target can follow existing hygiene schedules.
+        target_entity = cfg.get(CONF_CYLINDER_TARGET_ENTITY)
+        attribute = (
+            "temperature" if target_entity and target_entity.split(".")[0] in ("climate", "water_heater") else None
+        )
+        target_reading = self._float_state(target_entity, temperature=True, attribute=attribute)
+        d.cylinder_target = (
+            target_reading
+            if target_reading is not None and 30 <= target_reading <= 90
+            else self._opt(CONF_DHW_TARGET, DEFAULT_DHW_TARGET)
+        )
+        if target_entity and target_reading is None:
+            disabled.append("cylinder target unavailable; using configured target")
+        self._charge.update(
+            d.dhw_active,
+            d.cylinder_temp,
+            d.cylinder_target,
+            now,
+            self._opt(CONF_DHW_PROGRESS_MINUTES, DEFAULT_DHW_PROGRESS_MINUTES),
+            self._opt(CONF_DHW_TIMEOUT_MINUTES, DEFAULT_DHW_TIMEOUT_MINUTES),
+        )
+        d.dhw_charge_minutes = (now - self._charge.started_at).total_seconds() / 60 if self._charge.started_at else 0
+        d.cycles_10min = self._hub.cycles_10min(now)
+        d.dhw_charge_starts = self._charge.starts
+        d.last_burn_seconds, d.last_stop_reason = self._hub.last_burn_seconds, self._hub.last_stop_reason
+        d.cycling_status = "frequent_starts_diagnostic_only" if d.cycles_10min >= 3 else "normal"
 
-        # --- heating-side physics (always computed: also the DHW-and-heating/idle park value) ---
+        if d.live_setpoint is None:
+            d.mode, d.no_boiler, d.reason = "no_boiler", True, "flow setpoint unavailable or invalid"
+            return d
+
+        # Confirm device readback separately from a successful HA service call.
+        memory = self._hub.write_memory()
+        if memory.last_written_setpoint is not None and abs(d.live_setpoint - memory.last_written_setpoint) <= 0.5:
+            self._confirmed_target, self._pending_since = memory.last_written_setpoint, None
+        elif (
+            memory.last_written_setpoint is not None and self._confirmed_target is None and self._pending_since is None
+        ):
+            self._pending_since = now
+        d.confirmed_setpoint = self._confirmed_target
+        d.write_status = (
+            "pending_readback"
+            if self._pending_since
+            else "confirmed"
+            if self._confirmed_target is not None
+            else "not_attempted"
+        )
+        if self._pending_since and now - self._pending_since >= timedelta(minutes=3):
+            d.write_status = "unconfirmed_readback"
+        manual = False
+        if self._pending_since is None and self._confirmed_target is not None:
+            manual, self._manual_hold_state = detect_manual_hold(
+                d.live_setpoint,
+                memory.last_written_setpoint,
+                d.max_flow,
+                now,
+                self._manual_hold_state,
+                self._manual_hold_params(),
+            )
+        d.manual_hold_active = manual
+        mode = decide_mode(ModeInputs(self._enabled, bool(d.heat_demand and d.heat_demand > 0), d.dhw_active, manual))
+        physical_mode = decide_mode(ModeInputs(True, bool(d.heat_demand and d.heat_demand > 0), d.dhw_active, False))
+        operating = self._enabled and self._override != "hold" and not manual
+        heating_active = operating and physical_mode is Mode.HEATING
+        if heating_active:
+            control.heating_since = control.heating_since or now
+        else:
+            control.heating_since = None
+
+        rooms = {}
+        for entity in cfg.get(CONF_ROOM_CLIMATE_ENTITIES) or []:
+            st = self._state(entity)
+            if st is None or st.state == "off" or st.attributes.get("hvac_action") == "off":
+                continue
+            current = self._float_state(
+                entity, temperature=True, freshness=freshness, now=now, attribute="current_temperature"
+            )
+            requested = self._float_state(entity, temperature=True, attribute="temperature")
+            if current is not None and requested is not None:
+                rooms[entity] = (current, requested)
+        d.room_correction, d.room_error = control.rooms.update(rooms, now, heating_active)
+        control.demand = demand_correction_step(
+            control.demand, d.demand_filtered if demand_valid else None, now, active=heating_active
+        )
+        # When rooms are configured they determine comfort pressure. Do not
+        # assume a high valve percentage means a room is cold.
+        room_configured = bool(cfg.get(CONF_ROOM_CLIMATE_ENTITIES))
+        if room_configured and rooms:
+            d.demand_correction = 0.0
+        else:
+            d.demand_correction = control.demand.correction
+        comfort_limited = (d.room_error is not None and d.room_error > 0.3) or (
+            not rooms and d.demand_filtered is not None and d.demand_filtered > 70
+        )
+        settled = (
+            heating_active and control.heating_since is not None and now - control.heating_since >= timedelta(minutes=5)
+        )
+        # Require circulation evidence, not just a room asking for heat.
+        circulating = self._is_on(cfg.get(CONF_HEATING_ACTIVE_ENTITY), freshness=5) is True
         curve_params = self._curve_params()
         d.curve = heating_curve(d.outdoor_temp, curve_params) if d.outdoor_temp is not None else None
-
-        # v0.2.1 review fixes 11-12: the demand correction only accumulates while
-        # mode is heating or dhw_and_heating; in idle/dhw it decays towards 0 at
-        # its normal cadence instead (otherwise idle saturates it at -8 and
-        # heating starts 8 K low next time). When the raw demand signal itself is
-        # unavailable (not merely filtered-and-held), the state is frozen instead
-        # of decaying, in either direction, until the sensor returns.
-        demand_valid = heat_demand_raw is not None
-        demand_for_step = d.demand_filtered if demand_valid else None
-        demand_active = mode in (Mode.HEATING, Mode.DHW_AND_HEATING)
-        self._demand_state = demand_correction_step(
-            self._demand_state, demand_for_step, now, DemandCorrectionParams(), active=demand_active
+        floor_limited = (
+            d.curve is not None
+            and d.curve + d.demand_correction + control.return_trim.correction <= curve_params.flow_min
         )
-        d.demand_correction = self._demand_state.correction
-
-        # v0.2.1 review fix 6: freeze the heating return-ceiling accumulator while
-        # DHW is active — DHW has its own dhw_return_correction, and otherwise this
-        # accumulator ran against the heating ceiling (50) during every DHW charge
-        # and saturated at its -8 floor before being applied on exit.
-        if mode not in (Mode.DHW, Mode.DHW_AND_HEATING):
-            self._return_state = return_ceiling_step(self._return_state, d.return_temperature_used, d.return_fresh, self._return_params())
-        d.return_correction = self._return_state.correction
-        d.cycling_correction = cycling_guard_correction(d.cycles_10min, d.demand_filtered, CyclingGuardParams())
-        return_over_ceiling = d.return_fresh and d.return_temperature_used is not None and d.return_temperature_used > self._tunables[CONF_RETURN_CEILING]
-
+        if physical_mode in (Mode.DHW, Mode.DHW_AND_HEATING):
+            # Keep the old heating trim separate; reset its time origin.
+            control.return_trim = replace(control.return_trim, sampled_at=now)
+        else:
+            control.return_trim = return_ceiling_step(
+                control.return_trim,
+                self._return_filtered,
+                d.return_fresh,
+                self._return_params(),
+                now=now,
+                active=settled and circulating and not floor_limited,
+                comfort_limited=comfort_limited,
+            )
+        d.return_correction = 0.0 if comfort_limited else control.return_trim.correction
+        d.cycling_correction = 0.0
         heating_value = (
-            heating_target(d.outdoor_temp, self._demand_state, self._return_state, d.cycling_correction, curve_params)
-            if d.outdoor_temp is not None
+            max(
+                curve_params.flow_min,
+                min(curve_params.flow_max, d.curve + d.demand_correction + d.return_correction + d.room_correction),
+            )
+            if d.curve is not None
             else None
         )
-
-        # --- physical target: DHW wins when it has demand, else heating, else park at curve ---
-        # v0.2.1 review fix 11: idle parks at the bare curve value (already
-        # clamped to [flow_min, flow_max] by heating_curve), not the
-        # demand/return/cycling-corrected heating value.
-        dhw_issue_raised = False
-        persist_dhw_state = self._enabled and self._override == OVERRIDE_AUTO
-        was_dhw = self._prev_mode in (Mode.DHW, Mode.DHW_AND_HEATING)
-        if dhw_demand_bool and d.cylinder_temp is not None:
-            # v0.2.1 review fix 3a: only ignitions after the guard's last
-            # intervention count towards the next attempt.
-            ignitions_since_intervention = self._hub.ignitions_since(self._hub.dhw_cycling.last_intervention_at, now)
-            target, new_dhw_state, dhw_issue_raised = dhw_target(
-                d.cylinder_temp, d.return_temperature_used, d.return_fresh,
-                ignitions_since_intervention, self._hub.dhw_cycling, now, self._dhw_params()
+        if d.dhw_active:
+            params = self._dhw_params()
+            fallback = self._opt(CONF_DHW_FALLBACK_FLOW, params.dhw_flow_max)
+            target, _, _ = dhw_target(
+                None if self._charge.fallback else d.cylinder_temp,
+                None,
+                False,
+                0,
+                DhwCyclingState(),
+                now,
+                params,
+                cylinder_target=d.cylinder_target,
+                fallback=fallback,
             )
-            # v0.2.1 review fix 3b: only mutate/persist the cycling state when
-            # enabled and auto; in shadow/hold (or disabled) `new_dhw_state` is
-            # used for `would_write` display only, computed from a copy so
-            # observing a charge cannot poison future auto operation.
-            if persist_dhw_state:
-                self._hub.set_dhw_cycling(new_dhw_state)
-        elif dhw_demand_bool:
-            target = heating_value  # demanded but no cylinder reading: fall back to heating value
+            d.dhw_status = self._charge.reason or (
+                "fallback_missing_temperature" if d.cylinder_temp is None else "charging"
+            )
+            d.return_correction = d.demand_correction = d.room_correction = 0.0
         else:
-            target = d.curve if mode is Mode.IDLE else heating_value
-            # v0.2.1 review fix 3a: reset attempts once a DHW charge ends without
-            # reaching the sticky hold, so a stray attempt from one charge cannot
-            # combine with cycling in an unrelated later charge.
-            if was_dhw and persist_dhw_state and not self._hub.dhw_cycling.holding and self._hub.dhw_cycling.attempts > 0:
-                self._hub.set_dhw_cycling(DhwCyclingState())
-        d.dhw_issue_raised = dhw_issue_raised
-        if dhw_issue_raised and persist_dhw_state:
-            self._maybe_raise_dhw_issue()
+            target = d.curve if physical_mode is Mode.IDLE else heating_value
+        d.requested_target = target
 
-        # Leaving DHW mode restores the heating value immediately (§3.3.4), exempt from min_hold,
-        # like the return ceiling (§3.2.6).
-        now_dhw = mode in (Mode.DHW, Mode.DHW_AND_HEATING)
-        exempt_hysteresis = return_over_ceiling or (was_dhw and not now_dhw)
+        constraints = self._setpoint_constraints(d.max_flow)
+        if cfg.get(CONF_MAX_FLOW_ENTITY) and d.max_flow is None:
+            disabled.append("configured maximum flow unavailable; writes suspended")
+            target = None
+        if constraints is None:
+            disabled.append("invalid setpoint entity limits")
+            target = None
+        if target is not None:
+            lo, hi, step = constraints
+            regime_min = self._dhw_params().dhw_flow_min if d.dhw_active else curve_params.flow_min
+            regime_max = self._dhw_params().dhw_flow_max if d.dhw_active else curve_params.flow_max
+            # Entity grid is anchored at its native minimum, even when a
+            # configured heating/DHW floor lies between grid points.
+            target = effective_target(target, lo, min(hi, regime_max), step)
+            if target is not None and target < regime_min:
+                candidate = effective_target(regime_min + step / 2, lo, min(hi, regime_max), step)
+                target = candidate if candidate is not None and candidate >= regime_min else None
+            if target is None:
+                disabled.append("configured flow range conflicts with boiler limits; writes suspended")
 
-        memory = self._hub.write_memory()
+        if d.dhw_active and (target is None or target < d.cylinder_target + 5):
+            d.dhw_status = "insufficient_flow_headroom"
+        d.dhw_issue_raised = d.dhw_active and d.dhw_status != "charging"
+        if self._enabled and self._override == OVERRIDE_AUTO:
+            if d.dhw_issue_raised:
+                ir.async_create_issue(
+                    self.hass,
+                    DOMAIN,
+                    "dhw_charge_problem",
+                    is_fixable=False,
+                    severity=ir.IssueSeverity.WARNING,
+                    translation_key="dhw_charge_problem",
+                    translation_placeholders={"reason": d.dhw_status},
+                )
+            elif not d.dhw_active:
+                ir.async_delete_issue(self.hass, DOMAIN, "dhw_charge_problem")
+
+        was_dhw = control.previous_mode in (Mode.DHW, Mode.DHW_AND_HEATING)
+        transition = was_dhw != d.dhw_active
+        policy_memory = control.virtual_memory if self._override != OVERRIDE_AUTO else memory
+        if self._override != OVERRIDE_AUTO and policy_memory.last_written_setpoint is None:
+            policy_memory = memory
+        bounded_old = None
+        if constraints is not None and policy_memory.last_written_setpoint is not None:
+            bounded_old = effective_target(
+                policy_memory.last_written_setpoint,
+                constraints[0],
+                min(constraints[1], self._dhw_params().dhw_flow_max if d.dhw_active else curve_params.flow_max),
+                constraints[2],
+            )
+        limits_changed = (
+            policy_memory.last_written_setpoint is not None and bounded_old != policy_memory.last_written_setpoint
+        )
+        fallback_needed = d.dhw_active and (self._charge.fallback or d.cylinder_temp is None)
+        completion_needed = (
+            d.dhw_active
+            and policy_memory.last_written_setpoint is not None
+            and policy_memory.last_written_setpoint < d.cylinder_target + 5
+        )
         decision = decide_write(
-            mode, target, Override(self._override), memory, now,
-            exempt_hysteresis=exempt_hysteresis, hysteresis_params=self._hysteresis_params(),
+            mode,
+            target,
+            Override(self._override),
+            policy_memory,
+            now,
+            exempt_hysteresis=transition
+            or limits_changed
+            or fallback_needed
+            or completion_needed
+            or d.max_flow != self._last_max_flow,
+            hysteresis_params=self._hysteresis_params(),
         )
         d.mode, d.reason, d.action = mode.value, decision.reason, decision.action.value
         d.flow_setpoint = decision.setpoint if decision.action is Action.WRITE else decision.would_write
         d.would_write = decision.would_write
-
-        # v0.2.1 review fix 2: only record the write (and target_changed) when the
-        # service call actually succeeded — a swallowed failure previously still
-        # advanced the write memory, which later read as a manual change (live !=
-        # written, live != dial) and triggered a spurious 30-minute manual hold.
-        wrote_ok = await self._perform(decision, d.max_flow)
+        if self._override == "shadow" and operating and decision.would_write is not None:
+            control.virtual_memory = replace(
+                policy_memory,
+                last_written_setpoint=decision.would_write,
+                last_written_at=now,
+                last_target_change=now if decision.target_changed else policy_memory.last_target_change,
+            )
+        wrote_ok = await self._perform(decision)
         if decision.action is Action.WRITE and wrote_ok:
             self._hub.record_write(decision.setpoint, now, decision.target_changed)
+            readback = temp(CONF_FLOW_SETPOINT_ENTITY, None)
+            if readback is not None and abs(readback - decision.setpoint) <= 0.5:
+                self._confirmed_target, self._pending_since = decision.setpoint, None
+                d.write_status = "confirmed"
+            else:
+                if decision.target_changed or self._pending_since is None:
+                    self._pending_since = now
+                d.write_status = (
+                    "unconfirmed_readback" if now - self._pending_since >= timedelta(minutes=3) else "pending_readback"
+                )
         elif decision.action is Action.WRITE:
-            _LOGGER.warning("BFC: write failed this cycle; not recording last_written_setpoint/last_target_change")
-        d.last_written_setpoint = self._hub.last_written_setpoint
-        d.last_write = self._hub.last_written_at
+            d.write_status = "service_failed"
+        d.confirmed_setpoint = self._confirmed_target
+        d.last_written_setpoint, d.last_write = self._hub.last_written_setpoint, self._hub.last_written_at
         d.last_target_change = self._hub.last_target_change
-
-        self._prev_mode = mode
-        d.disabled_features = disabled
+        if wrote_ok or (self._override == "shadow" and operating and decision.would_write is not None):
+            control.previous_mode = physical_mode
+        self._prev_mode, self._last_max_flow = mode, d.max_flow
         await self._hub.async_save()
         return d

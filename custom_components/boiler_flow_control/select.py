@@ -1,4 +1,5 @@
 """Mode override select: auto / shadow / hold (§4). Shadow is the default."""
+
 from __future__ import annotations
 
 from homeassistant.components.select import SelectEntity
@@ -34,10 +35,15 @@ class BFCModeOverrideSelect(BFCEntity, SelectEntity, RestoreEntity):
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         last = await self.async_get_last_state()
-        if last is not None and last.state in self._attr_options:
+        if (
+            self.coordinator._store.get("mode_override") is None
+            and last is not None
+            and last.state in self._attr_options
+        ):
             self.coordinator.override = last.state
 
     async def async_select_option(self, option: str) -> None:
         self.coordinator.override = option
         self.async_write_ha_state()
+        await self.coordinator.async_save_settings()
         await self.coordinator.async_request_refresh()

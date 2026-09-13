@@ -1,10 +1,12 @@
 """Boiler Flow Control — dynamic flow-temperature setpoint for ems-esp (phase 1)."""
+
 from __future__ import annotations
 
 import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
 
 from .const import DOMAIN
 from .coordinator import BFCCoordinator
@@ -13,7 +15,7 @@ from .store import BFCStore
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = ["sensor", "switch", "select", "number", "button"]
+PLATFORMS = ["sensor", "binary_sensor", "switch", "select", "number", "button"]
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -29,6 +31,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hub = BoilerFlowHub(store=store)
     hub.load()
+    ir.async_delete_issue(hass, DOMAIN, "dhw_cycling_unfixable")
 
     coordinator = BFCCoordinator(hass, entry, store, hub)
     await coordinator.async_config_entry_first_refresh()
@@ -41,6 +44,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unsub_heating_active is not None:
         entry.async_on_unload(unsub_heating_active)
 
+    unsub_dhw = coordinator.async_subscribe_dhw()
+    if unsub_dhw is not None:
+        entry.async_on_unload(unsub_dhw)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(async_update_options))
     return True

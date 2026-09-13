@@ -1,4 +1,5 @@
 """Live tunable numbers (§4): design flow, design outdoor, return ceiling, DHW delta."""
+
 from __future__ import annotations
 
 from homeassistant.components.number import NumberEntity, NumberMode
@@ -45,4 +46,5 @@ class BFCNumber(BFCEntity, NumberEntity):
     async def async_set_native_value(self, value: float) -> None:
         self.coordinator.set_tunable(self._key, value)
         self.async_write_ha_state()
+        await self.coordinator.async_save_settings()
         await self.coordinator.async_request_refresh()
